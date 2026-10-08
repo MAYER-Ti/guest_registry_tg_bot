@@ -508,12 +508,14 @@ async def main() -> None:
     store = Store(config.db_path)
     dispatcher = build_dispatcher(config, store)
     async with Bot(config.token) as bot:
+        identity = await bot.get_me()
+        logging.getLogger(__name__).info("Telegram connected: @%s (id=%s)", identity.username, identity.id)
         await bot.delete_webhook(drop_pending_updates=False)
         await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(name)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):

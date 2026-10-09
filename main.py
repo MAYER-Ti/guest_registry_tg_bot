@@ -209,13 +209,23 @@ async def send_card(
     details: str = "",
     entry_status: str = "open", entry_reason: str = "",
 ) -> None:
-    summary = (f"{title}\n\nИмя: {name}\nТелефон: {phone}\n"
-               f"Статус: {ENTRY_LABELS[entry_status]}")
+    header = (f"{title}\n\nИмя: {name}\nТелефон: {phone}\n"
+              f"Статус: {ENTRY_LABELS[entry_status]}")
+    summary = f"{header}\nПричина: {entry_reason or '—'}"
     if details:
         summary += "\n\n" + details
-    full = f"{summary}\n\nПричина: {entry_reason or '—'}\n\nКомментарий: {comment or '—'}"
+    full = f"{summary}\n\nКомментарий: {comment or '—'}"
     long_text = len(full.encode("utf-16-le")) // 2 > 1024
-    caption = summary if long_text else full
+    chunks = []
+    caption = full
+    if long_text:
+        caption = summary
+        if len(summary.encode("utf-16-le")) // 2 > 1024:
+            caption = header
+            chunks.extend(text_chunks(f"Причина:\n{entry_reason or '—'}"))
+            if details:
+                chunks.extend(text_chunks(details))
+        chunks.extend(text_chunks(f"Комментарий:\n{comment or '—'}"))
     # Every photo has a local backup; file_id is only a sending optimization.
     try:
         await message.answer_photo(
@@ -231,7 +241,6 @@ async def send_card(
             reply_markup=None if long_text else reply_markup, protect_content=True,
         )
     if long_text:
-        chunks = text_chunks(f"Причина:\n{entry_reason or '—'}") + text_chunks(f"Комментарий:\n{comment or '—'}")
         for index, chunk in enumerate(chunks):
             await message.answer(
                 chunk, reply_markup=reply_markup if index == len(chunks) - 1 else None,

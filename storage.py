@@ -23,7 +23,8 @@ from uuid import uuid4
 
 MAX_PHOTO_BYTES = 10 * 1024 * 1024
 _PHONE_FORMAT = re.compile(r"^[\d\s()+.\-]+$")
-_EDITABLE_FIELDS = {"name", "phone", "comment", "photo", "photo_file_id"}
+_EDITABLE_FIELDS = {"name", "phone", "comment", "photo", "photo_file_id",
+                    "entry_status", "entry_reason"}
 
 
 class DuplicatePhoneError(ValueError):
@@ -52,6 +53,8 @@ class Guest:
     created_at: str
     updated_at: str
     version: int
+    entry_status: str = "open"
+    entry_reason: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,7 +115,8 @@ def _validate_actor(actor_id: int) -> None:
 
 
 def _validate_fields(*, name: str, phone: str, comment: str, photo: bytes,
-                     photo_file_id: str) -> dict[str, object]:
+                     photo_file_id: str, entry_status: str = "open",
+                     entry_reason: str = "") -> dict[str, object]:
     if not isinstance(name, str):
         raise ValueError("Имя должно быть текстом.")
     name = " ".join(name.split())
@@ -125,6 +129,10 @@ def _validate_fields(*, name: str, phone: str, comment: str, photo: bytes,
         raise ValueError("Нужно фото размером не более 10 МБ.")
     if not isinstance(photo_file_id, str) or not photo_file_id.strip() or len(photo_file_id) > 1024:
         raise ValueError("Некорректный идентификатор фото Telegram.")
+    if not isinstance(entry_status, str) or entry_status not in {"open", "closed"}:
+        raise ValueError("Статус входа должен быть «вход открыт» или «вход закрыт».")
+    if not isinstance(entry_reason, str) or len(entry_reason) > 3000:
+        raise ValueError("Причина должна содержать не более 3000 символов.")
     return {
         "name": name,
         "name_key": normalize_name(name),
@@ -133,6 +141,8 @@ def _validate_fields(*, name: str, phone: str, comment: str, photo: bytes,
         "comment": comment.strip(),
         "photo": photo,
         "photo_file_id": photo_file_id.strip(),
+        "entry_status": entry_status,
+        "entry_reason": entry_reason.strip(),
     }
 
 
@@ -203,13 +213,15 @@ class Store:
             tables = {row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )}
-            if "guests" in tables and "visits" not in tables:
-                # Protect real cards before the first upgrade. Run the online
-                # backup outside the schema transaction; a backup failure must
-                # abort startup without adding any schema or changing cards.
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(guests)")}
+            missing_entry_columns = {"entry_status", "entry_reason"} - columns
+            if "guests" in tables and ("visits" not in tables or missing_entry_columns):
+                # Back up old/partial schemas before any schema change. Run the
+                # online backup outside the transaction; failure aborts startup.
                 stamp = _utc_datetime().strftime("%Y%m%dT%H%M%S%fZ")
+                upgrade = "visits" if "visits" not in tables else "entry-status"
                 self.backup(self.path.parent / "backups" /
-                            f"guests-before-visits-{stamp}-{uuid4().hex}.sqlite3")
+                            f"guests-before-{upgrade}-{stamp}-{uuid4().hex}.sqlite3")
             connection.execute("BEGIN IMMEDIATE")
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS guests (
@@ -225,9 +237,25 @@ class Store:
                     updated_by INTEGER NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
-                    version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0)
+                    version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0),
+                    entry_status TEXT NOT NULL DEFAULT 'open'
+                        CHECK (entry_status IN ('open', 'closed')),
+                    entry_reason TEXT NOT NULL DEFAULT '' CHECK (length(entry_reason) <= 3000)
                 )
             """)
+            # Re-read after the write lock, allowing another process to have
+            # completed the migration while this one prepared its backup.
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(guests)")}
+            if "entry_status" not in columns:
+                connection.execute("""
+                    ALTER TABLE guests ADD COLUMN entry_status TEXT NOT NULL DEFAULT 'open'
+                    CHECK (entry_status IN ('open', 'closed'))
+                """)
+            if "entry_reason" not in columns:
+                connection.execute("""
+                    ALTER TABLE guests ADD COLUMN entry_reason TEXT NOT NULL DEFAULT ''
+                    CHECK (length(entry_reason) <= 3000)
+                """)
             # Additive migration leaves every existing guest and photo intact.
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS visits (
@@ -264,10 +292,12 @@ class Store:
             connection.close()
 
     def add_guest(self, *, name: str, phone: str, comment: str, photo: bytes,
-                  photo_file_id: str, actor_id: int) -> Guest:
+                  photo_file_id: str, actor_id: int, entry_status: str = "open",
+                  entry_reason: str = "") -> Guest:
         _validate_actor(actor_id)
         fields = _validate_fields(name=name, phone=phone, comment=comment,
-                                  photo=photo, photo_file_id=photo_file_id)
+                                  photo=photo, photo_file_id=photo_file_id,
+                                  entry_status=entry_status, entry_reason=entry_reason)
         now = _timestamp()
         fields.update(created_by=actor_id, updated_by=actor_id,
                       created_at=now, updated_at=now)
@@ -275,9 +305,11 @@ class Store:
             try:
                 cursor = connection.execute("""
                     INSERT INTO guests (name, name_key, phone, phone_key, comment,
-                        photo, photo_file_id, created_by, updated_by, created_at, updated_at)
+                        photo, photo_file_id, created_by, updated_by, created_at, updated_at,
+                        entry_status, entry_reason)
                     VALUES (:name, :name_key, :phone, :phone_key, :comment, :photo,
-                        :photo_file_id, :created_by, :updated_by, :created_at, :updated_at)
+                        :photo_file_id, :created_by, :updated_by, :created_at, :updated_at,
+                        :entry_status, :entry_reason)
                 """, fields)
             except sqlite3.IntegrityError as exc:
                 if "guests.phone_key" in str(exc):
@@ -336,6 +368,7 @@ class Store:
                     UPDATE guests SET name = :name, name_key = :name_key,
                         phone = :phone, phone_key = :phone_key, comment = :comment,
                         photo = :photo, photo_file_id = :photo_file_id,
+                        entry_status = :entry_status, entry_reason = :entry_reason,
                         updated_by = :updated_by, updated_at = :updated_at,
                         version = version + 1
                     WHERE id = :id AND version = :expected_version

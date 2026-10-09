@@ -27,6 +27,10 @@ from storage import (
 ADD = "➕ Добавить гостя"
 FIND = "🔎 Найти гостя"
 CANCEL = "Отмена"
+ENTRY_OPEN = "🟢 Вход открыт"
+ENTRY_CLOSED = "🔴 Вход закрыт"
+NO_REASON = "Без причины"
+ENTRY_LABELS = {"open": ENTRY_OPEN, "closed": ENTRY_CLOSED}
 PAGE_SIZE = 8
 VISIT_PAGE_SIZE = 5
 MOSCOW = timezone(timedelta(hours=3))
@@ -42,6 +46,14 @@ COMMENT_MENU = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text="Без комментария")], [KeyboardButton(text=CANCEL)]],
     resize_keyboard=True,
 )
+ENTRY_MENU = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text=ENTRY_OPEN), KeyboardButton(text=ENTRY_CLOSED)],
+              [KeyboardButton(text=CANCEL)]], resize_keyboard=True,
+)
+REASON_MENU = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text=NO_REASON)], [KeyboardButton(text=CANCEL)]],
+    resize_keyboard=True,
+)
 
 
 class AddGuest(StatesGroup):
@@ -49,6 +61,8 @@ class AddGuest(StatesGroup):
     phone = State()
     name = State()
     comment = State()
+    entry_status = State()
+    entry_reason = State()
     confirm = State()
 
 
@@ -58,6 +72,7 @@ class FindGuest(StatesGroup):
 
 class EditGuest(StatesGroup):
     value = State()
+    entry_reason = State()
 
 
 class DeleteGuest(StatesGroup):
@@ -123,6 +138,20 @@ def clean_comment(value: str) -> str:
     return "" if value in ("-", "Без комментария") else value
 
 
+def clean_entry_status(value: str) -> str:
+    for status, label in ENTRY_LABELS.items():
+        if value.strip() in (label, label[2:]):
+            return status
+    raise ValueError("Выбери «Вход открыт» или «Вход закрыт» кнопкой.")
+
+
+def clean_entry_reason(value: str) -> str:
+    value = value.strip()
+    if len(value) > 3000:
+        raise ValueError("Причина слишком длинная. Максимум — 3000 символов.")
+    return "" if value in ("-", NO_REASON) else value
+
+
 def text_chunks(value: str, max_units: int = 4000) -> list[str]:
     chunks, current, units = [], [], 0
     for char in value:
@@ -178,18 +207,20 @@ async def send_card(
     photo_file_id: str = "", title: str = "Карточка гостя",
     reply_markup: InlineKeyboardMarkup | None = None,
     details: str = "",
+    entry_status: str = "open", entry_reason: str = "",
 ) -> None:
-    summary = f"{title}\n\nИмя: {name}\nТелефон: {phone}"
+    summary = (f"{title}\n\nИмя: {name}\nТелефон: {phone}\n"
+               f"Статус: {ENTRY_LABELS[entry_status]}")
     if details:
         summary += "\n\n" + details
-    full = f"{summary}\n\nКомментарий: {comment or '—'}"
-    long_comment = len(full.encode("utf-16-le")) // 2 > 1024
-    caption = summary if long_comment else full
+    full = f"{summary}\n\nПричина: {entry_reason or '—'}\n\nКомментарий: {comment or '—'}"
+    long_text = len(full.encode("utf-16-le")) // 2 > 1024
+    caption = summary if long_text else full
     # Every photo has a local backup; file_id is only a sending optimization.
     try:
         await message.answer_photo(
             photo=photo_file_id or BufferedInputFile(photo, filename="guest.jpg"),
-            caption=caption, reply_markup=None if long_comment else reply_markup,
+            caption=caption, reply_markup=None if long_text else reply_markup,
             protect_content=True,
         )
     except TelegramBadRequest:
@@ -197,10 +228,10 @@ async def send_card(
             raise
         await message.answer_photo(
             photo=BufferedInputFile(photo, filename="guest.jpg"), caption=caption,
-            reply_markup=None if long_comment else reply_markup, protect_content=True,
+            reply_markup=None if long_text else reply_markup, protect_content=True,
         )
-    if long_comment:
-        chunks = text_chunks(f"Комментарий:\n{comment}")
+    if long_text:
+        chunks = text_chunks(f"Причина:\n{entry_reason or '—'}") + text_chunks(f"Комментарий:\n{comment or '—'}")
         for index, chunk in enumerate(chunks):
             await message.answer(
                 chunk, reply_markup=reply_markup if index == len(chunks) - 1 else None,
@@ -215,6 +246,7 @@ async def show_guest(message: Message, guest: Guest, store: Store) -> None:
         photo=guest.photo, photo_file_id=guest.photo_file_id,
         title=f"Карточка гостя №{guest.id}", reply_markup=card_actions(guest, summary),
         details=visit_details(summary),
+        entry_status=guest.entry_status, entry_reason=guest.entry_reason,
     )
 
 
@@ -231,7 +263,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         await state.clear()
         await message.answer(
             "Общая база гостей. Выбери действие.\n"
-            "В карточке можно изменить фото, телефон, имя или комментарий.\n"
+            "В карточке можно изменить фото, телефон, имя, комментарий, статус входа и причину.\n"
             "Гость пришёл — нажми «Старт», ушёл — «Стоп». Время всех визитов суммируется.\n"
             "Прервать действие: /cancel.", reply_markup=MENU,
         )
@@ -311,14 +343,40 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         except ValueError as error:
             await message.answer(str(error))
             return
+        await state.update_data(comment=comment)
+        await state.set_state(AddGuest.entry_status)
+        await message.answer("Выбери статус входа для гостя.", reply_markup=ENTRY_MENU)
+
+    @router.message(AddGuest.entry_status)
+    async def add_entry_status(message: Message, state: FSMContext):
+        try:
+            status = clean_entry_status(message.text or "")
+        except ValueError as error:
+            await message.answer(str(error), reply_markup=ENTRY_MENU)
+            return
+        await state.update_data(entry_status=status)
+        await state.set_state(AddGuest.entry_reason)
+        await message.answer("Укажи причину статуса или нажми «Без причины».", reply_markup=REASON_MENU)
+
+    @router.message(AddGuest.entry_reason)
+    async def add_entry_reason(message: Message, state: FSMContext):
+        if message.text is None:
+            await message.answer("Пришли причину текстом или нажми «Без причины».")
+            return
+        try:
+            reason = clean_entry_reason(message.text)
+        except ValueError as error:
+            await message.answer(str(error))
+            return
         nonce = secrets.token_hex(4)
-        await state.update_data(comment=comment, nonce=nonce)
+        await state.update_data(entry_reason=reason, nonce=nonce)
         await state.set_state(AddGuest.confirm)
         draft = await state.get_data()
         await message.answer("Проверь карточку перед сохранением.", reply_markup=CANCEL_MENU)
         await send_card(
-            message, name=draft["name"], phone=draft["phone"], comment=comment,
+            message, name=draft["name"], phone=draft["phone"], comment=draft["comment"],
             photo=draft["photo"], photo_file_id=draft["photo_file_id"], title="Новая карточка",
+            entry_status=draft["entry_status"], entry_reason=reason,
             reply_markup=keyboard([[("✅ Сохранить", f"save:{nonce}"), ("Отмена", "cancel")]]),
         )
 
@@ -339,6 +397,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
             guest = await asyncio.to_thread(
                 store.add_guest, name=draft["name"], phone=draft["phone"], comment=draft["comment"],
                 photo=draft["photo"], photo_file_id=draft["photo_file_id"], actor_id=query.from_user.id,
+                entry_status=draft["entry_status"], entry_reason=draft["entry_reason"],
             )
         except DuplicatePhoneError:
             await state.clear()
@@ -519,13 +578,14 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         await query.message.answer("Что изменить?", reply_markup=keyboard([
             [("Фото", f"field:photo:{key}"), ("Телефон", f"field:phone:{key}")],
             [("Имя", f"field:name:{key}"), ("Комментарий", f"field:comment:{key}")],
+            [("Статус входа", f"field:entry_status:{key}"), ("Причина", f"field:entry_reason:{key}")],
             [("Отмена", "cancel")],
         ]))
 
     @router.callback_query(F.data.startswith("field:"))
     async def field(query: CallbackQuery, state: FSMContext):
         parts = query.data.split(":")
-        if len(parts) != 4 or parts[1] not in {"photo", "phone", "name", "comment"}:
+        if len(parts) != 4 or parts[1] not in {"photo", "phone", "name", "comment", "entry_status", "entry_reason"}:
             await query.answer("Некорректная кнопка.", show_alert=True)
             return
         guest = await current_guest(query, parts)
@@ -538,8 +598,31 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         prompts = {
             "photo": "Пришли новую фотографию.", "phone": "Введи новый телефон или пришли контакт.",
             "name": "Введи новое имя.", "comment": "Введи новый комментарий. Чтобы очистить, отправь «-».",
+            "entry_status": "Выбери новый статус входа. Затем укажи причину — оба поля сохранятся вместе.",
+            "entry_reason": "Введи новую причину. Чтобы очистить, нажми «Без причины».",
         }
-        await query.message.answer(prompts[parts[1]], reply_markup=CANCEL_MENU)
+        markup = ENTRY_MENU if parts[1] == "entry_status" else REASON_MENU if parts[1] == "entry_reason" else CANCEL_MENU
+        await query.message.answer(prompts[parts[1]], reply_markup=markup)
+
+    async def persist_edit(message: Message, state: FSMContext, fields: dict):
+        data = await state.get_data()
+        try:
+            guest = await asyncio.to_thread(
+                store.update_guest, data["guest_id"], data["version"], message.from_user.id, **fields,
+            )
+        except DuplicatePhoneError:
+            await message.answer("Этот телефон уже занят другой карточкой. Введи другой номер.")
+            return
+        except StaleGuestError:
+            await state.clear()
+            await message.answer("Другой сотрудник изменил или удалил карточку. Найди её заново.", reply_markup=MENU)
+            return
+        except ValueError as error:
+            await message.answer(str(error))
+            return
+        await state.clear()
+        await message.answer("Карточка обновлена.", reply_markup=MENU)
+        await show_guest(message, guest, store)
 
     @router.message(EditGuest.value)
     async def edit_value(message: Message, state: FSMContext, bot: Bot):
@@ -554,29 +637,40 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
                 fields = {"phone": "+" + normalize_phone(value)}
             elif field_name == "name":
                 fields = {"name": clean_name(message.text or "")}
+            elif field_name == "entry_status":
+                status = clean_entry_status(message.text or "")
+                await state.update_data(entry_status=status)
+                await state.set_state(EditGuest.entry_reason)
+                await message.answer("Укажи причину нового статуса или нажми «Без причины».", reply_markup=REASON_MENU)
+                return
+            elif field_name == "entry_reason":
+                if message.text is None:
+                    raise ValueError("Пришли причину текстом или нажми «Без причины».")
+                fields = {"entry_reason": clean_entry_reason(message.text)}
             else:
                 if message.text is None:
                     raise ValueError("Пришли комментарий текстом.")
                 fields = {"comment": clean_comment(message.text)}
-            guest = await asyncio.to_thread(
-                store.update_guest, data["guest_id"], data["version"], message.from_user.id, **fields,
-            )
-        except DuplicatePhoneError:
-            await message.answer("Этот телефон уже занят другой карточкой. Введи другой номер.")
-            return
-        except StaleGuestError:
-            await state.clear()
-            await message.answer("Другой сотрудник изменил или удалил карточку. Найди её заново.", reply_markup=MENU)
-            return
         except ValueError as error:
             await message.answer(str(error))
             return
         except (TelegramBadRequest, TelegramNetworkError):
             await message.answer("Не удалось принять фото. Попробуй ещё раз.")
             return
-        await state.clear()
-        await message.answer("Карточка обновлена.", reply_markup=MENU)
-        await show_guest(message, guest, store)
+        await persist_edit(message, state, fields)
+
+    @router.message(EditGuest.entry_reason)
+    async def edit_status_reason(message: Message, state: FSMContext):
+        if message.text is None:
+            await message.answer("Пришли причину текстом или нажми «Без причины».")
+            return
+        try:
+            reason = clean_entry_reason(message.text)
+        except ValueError as error:
+            await message.answer(str(error))
+            return
+        data = await state.get_data()
+        await persist_edit(message, state, {"entry_status": data["entry_status"], "entry_reason": reason})
 
     @router.callback_query(F.data.startswith("delete:"))
     async def ask_delete(query: CallbackQuery, state: FSMContext):

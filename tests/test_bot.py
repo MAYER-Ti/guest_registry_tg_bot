@@ -120,20 +120,29 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
                         return button.callback_data
         raise AssertionError(f"No callback starting with {prefix!r}")
 
-    def seed(self, *, name="Иван Петров", phone="+79991234567", comment="Постоянный гость"):
+    def seed(self, *, name="Иван Петров", phone="+79991234567", comment="Постоянный гость",
+             entry_status="open", entry_reason=""):
         return self.store.add_guest(
             name=name, phone=phone, comment=comment, photo=b"seed-photo",
-            photo_file_id="seed-file-id", actor_id=101,
+            photo_file_id="seed-file-id", actor_id=101, entry_status=entry_status,
+            entry_reason=entry_reason,
         )
 
     async def draft(self, *, user_id=101, name="Иван Петров", phone="8 (999) 123-45-67",
-                    comment="Постоянный гость"):
+                    comment="Постоянный гость", entry_status=None, entry_reason=None):
         await self.message(main.ADD, user_id=user_id)
         await self.message(user_id=user_id, photo=True)
         await self.message(phone, user_id=user_id)
         await self.message(name, user_id=user_id)
-        calls = await self.message(comment, user_id=user_id)
+        await self.message(comment, user_id=user_id)
+        await self.message(entry_status or main.ENTRY_OPEN, user_id=user_id)
+        calls = await self.message(entry_reason or main.NO_REASON, user_id=user_id)
         return self.button(calls, "save:"), calls
+
+    @staticmethod
+    def card_text(calls):
+        return "".join((call.caption or "") if isinstance(call, SendPhoto) else (call.text or "")
+                       for call in calls if isinstance(call, (SendPhoto, SendMessage)))
 
     async def test_full_create_then_other_staff_searches_shared_card(self):
         save, preview = await self.draft()
@@ -146,11 +155,15 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("Иван Петров", guest.name)
         self.assertEqual(b"fake-jpeg-bytes", guest.photo)
         self.assertEqual(101, guest.created_by)
+        self.assertEqual("open", guest.entry_status)
+        self.assertEqual("", guest.entry_reason)
         await self.message(main.FIND, user_id=102)
         found = await self.message("4567", user_id=102)
         shown = next(call for call in found if isinstance(call, SendPhoto))
         self.assertIn("Иван Петров", shown.caption)
         self.assertIn("Постоянный гость", shown.caption)
+        self.assertIn("Статус: " + main.ENTRY_OPEN, shown.caption)
+        self.assertIn("Причина: —", shown.caption)
         self.assertTrue(shown.protect_content)
 
     async def test_repeated_save_and_cancelled_draft_cannot_create_again(self):
@@ -164,6 +177,178 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         await self.message("/cancel")
         await self.callback(new_save)
         self.assertEqual(0, self.store.count_search("Другой"))
+
+    async def test_closed_guest_preview_and_saved_status_are_shared_with_other_staff(self):
+        reason = "Нарушил правила посещения"
+        save, preview = await self.draft(entry_status=main.ENTRY_CLOSED, entry_reason=reason)
+        self.assertIn("Статус: " + main.ENTRY_CLOSED, self.card_text(preview))
+        self.assertIn("Причина: " + reason, self.card_text(preview))
+        self.assertEqual(0, self.store.count_search("Иван"))
+        await self.callback(save)
+        guest = self.store.find_phone("+79991234567")
+        self.assertEqual("closed", guest.entry_status)
+        self.assertEqual(reason, guest.entry_reason)
+        await self.message(main.FIND, user_id=104)
+        found = await self.message("Иван", user_id=104)
+        self.assertIn("Статус: " + main.ENTRY_CLOSED, self.card_text(found))
+        self.assertIn("Причина: " + reason, self.card_text(found))
+
+    async def test_status_edit_saves_status_and_reason_together_and_is_visible_to_staff(self):
+        guest = self.seed()
+        fields = await self.callback(f"edit:{guest.id}:{guest.version}", user_id=102)
+        status = self.button(fields, "field:entry_status:")
+        self.assertEqual(f"field:entry_reason:{guest.id}:{guest.version}",
+                         self.button(fields, "field:entry_reason:"))
+        await self.callback(status, user_id=102)
+        await self.message(main.ENTRY_CLOSED, user_id=102)
+        self.assertEqual(guest, self.store.get_guest(guest.id))
+        changed = await self.message("Потребовал закрыть вход", user_id=102)
+        current = self.store.get_guest(guest.id)
+        self.assertEqual("closed", current.entry_status)
+        self.assertEqual("Потребовал закрыть вход", current.entry_reason)
+        self.assertEqual(102, current.updated_by)
+        self.assertEqual(guest.version + 1, current.version)
+        self.assertIn("Статус: " + main.ENTRY_CLOSED, self.card_text(changed))
+        shared = await self.callback(f"view:{guest.id}", user_id=103)
+        self.assertIn("Причина: Потребовал закрыть вход", self.card_text(shared))
+        await self.callback(f"field:entry_status:{guest.id}:{current.version}", user_id=104)
+        await self.message(main.ENTRY_OPEN, user_id=104)
+        await self.message(main.NO_REASON, user_id=104)
+        reopened = self.store.get_guest(guest.id)
+        self.assertEqual("open", reopened.entry_status)
+        self.assertEqual("", reopened.entry_reason)
+        self.assertEqual(current.version + 1, reopened.version)
+
+    async def test_reason_only_edit_and_clear_preserve_status_and_other_guest_data(self):
+        guest = self.seed(entry_status="closed", entry_reason="Первоначальная причина")
+        await self.callback(f"field:entry_reason:{guest.id}:{guest.version}", user_id=103)
+        changed = await self.message("  Исправленная причина  ", user_id=103)
+        current = self.store.get_guest(guest.id)
+        self.assertEqual("closed", current.entry_status)
+        self.assertEqual("Исправленная причина", current.entry_reason)
+        self.assertEqual((guest.name, guest.phone, guest.comment, guest.photo),
+                         (current.name, current.phone, current.comment, current.photo))
+        self.assertIn("Причина: Исправленная причина", self.card_text(changed))
+        await self.callback(f"field:entry_reason:{guest.id}:{current.version}", user_id=104)
+        cleared = await self.message(main.NO_REASON, user_id=104)
+        final = self.store.get_guest(guest.id)
+        self.assertEqual("closed", final.entry_status)
+        self.assertEqual("", final.entry_reason)
+        self.assertIn("Причина: —", self.card_text(cleared))
+
+    async def test_cancelled_status_or_reason_edit_writes_nothing(self):
+        guest = self.seed(entry_reason="Согласовано")
+        await self.callback(f"field:entry_status:{guest.id}:{guest.version}")
+        await self.message(main.ENTRY_CLOSED)
+        await self.message(main.CANCEL)
+        await self.message("Причина отменённого изменения")
+        self.assertEqual(guest, self.store.get_guest(guest.id))
+        await self.callback(f"field:entry_reason:{guest.id}:{guest.version}")
+        await self.message("/cancel")
+        await self.message(main.NO_REASON)
+        self.assertEqual(guest, self.store.get_guest(guest.id))
+
+    async def test_stale_status_edit_cannot_overwrite_another_staff_reason(self):
+        guest = self.seed(entry_reason="Старое значение")
+        await self.callback(f"field:entry_status:{guest.id}:{guest.version}", user_id=101)
+        await self.message(main.ENTRY_CLOSED, user_id=101)
+        await self.callback(f"field:entry_reason:{guest.id}:{guest.version}", user_id=102)
+        await self.message("Согласовано другим сотрудником", user_id=102)
+        await self.message("Устаревшее изменение", user_id=101)
+        current = self.store.get_guest(guest.id)
+        self.assertEqual("open", current.entry_status)
+        self.assertEqual("Согласовано другим сотрудником", current.entry_reason)
+        self.assertEqual(102, current.updated_by)
+        self.assertEqual(guest.version + 1, current.version)
+
+    async def test_invalid_new_status_and_oversized_reason_do_not_create_guest(self):
+        await self.message(main.ADD)
+        await self.message(photo=True)
+        await self.message("+79991234567")
+        await self.message("Иван Петров")
+        status_prompt = await self.message("Постоянный гость")
+        reply_buttons = {button.text for call in status_prompt
+                         for row in getattr(getattr(call, "reply_markup", None), "keyboard", [])
+                         for button in row}
+        self.assertTrue({main.ENTRY_OPEN, main.ENTRY_CLOSED}.issubset(reply_buttons))
+        invalid = await self.message("Неопределённый статус")
+        self.assertFalse(any(getattr(call, "reply_markup", None) and
+                             getattr(call.reply_markup, "inline_keyboard", None)
+                             for call in invalid))
+        self.assertEqual(0, self.store.count_search("Иван"))
+        await self.message(main.ENTRY_CLOSED)
+        oversized = await self.message("я" * 3001)
+        self.assertFalse(any(isinstance(call, SendPhoto) for call in oversized))
+        self.assertEqual(0, self.store.count_search("Иван"))
+        valid = await self.message("Проверенная причина")
+        await self.callback(self.button(valid, "save:"))
+        current = self.store.find_phone("+79991234567")
+        self.assertEqual("closed", current.entry_status)
+        self.assertEqual("Проверенная причина", current.entry_reason)
+
+    async def test_invalid_edited_status_and_oversized_reason_write_nothing(self):
+        guest = self.seed()
+        await self.callback(f"field:entry_status:{guest.id}:{guest.version}")
+        await self.message("Запрещён или нет?")
+        self.assertEqual(guest, self.store.get_guest(guest.id))
+        await self.message(main.ENTRY_CLOSED)
+        await self.message("я" * 3001)
+        self.assertEqual(guest, self.store.get_guest(guest.id))
+        await self.message("Проверенная причина")
+        current = self.store.get_guest(guest.id)
+        self.assertEqual("closed", current.entry_status)
+        self.assertEqual("Проверенная причина", current.entry_reason)
+        await self.callback(f"field:entry_reason:{guest.id}:{current.version}")
+        await self.message("я" * 3001)
+        self.assertEqual(current, self.store.get_guest(guest.id))
+        await self.message(main.NO_REASON)
+        self.assertEqual("", self.store.get_guest(guest.id).entry_reason)
+
+    async def test_long_reason_and_comment_are_not_lost_or_duplicated_and_actions_appear_once(self):
+        reason, comment = "😡" * 2500, "😀" * 2500
+        save, preview = await self.draft(entry_status=main.ENTRY_CLOSED,
+                                         entry_reason=reason, comment=comment)
+        await self.callback(save)
+        guest = self.store.find_phone("+79991234567")
+        shown = await self.callback(f"view:{guest.id}", user_id=104)
+        for calls, action in ((preview, "save:"), (shown, "edit:")):
+            text = self.card_text(calls)
+            self.assertIn("Статус: " + main.ENTRY_CLOSED, text)
+            self.assertIn("Причина:", text)
+            self.assertIn(reason, text)
+            self.assertIn(comment, text)
+            self.assertEqual(2500, text.count("😡"))
+            self.assertEqual(2500, text.count("😀"))
+            messages = [call for call in calls if isinstance(call, (SendPhoto, SendMessage))]
+            self.assertEqual(1, sum(isinstance(call, SendPhoto) for call in messages))
+            for call in messages:
+                payload = call.caption if isinstance(call, SendPhoto) else call.text
+                self.assertLessEqual(len(payload.encode("utf-16-le")) // 2,
+                                     1024 if isinstance(call, SendPhoto) else 4096)
+                self.assertTrue(call.protect_content)
+            action_messages = [call for call in messages
+                               if getattr(getattr(call, "reply_markup", None), "inline_keyboard", None)]
+            self.assertEqual([messages[-1]], action_messages)
+            self.button(action_messages, action)
+        self.assertEqual(reason, guest.entry_reason)
+        self.assertEqual(comment, guest.comment)
+
+    async def test_status_change_preserves_active_visit_and_stop_button(self):
+        guest = self.seed()
+        idle = await self.callback(f"view:{guest.id}")
+        started = await self.callback(self.button(idle, "start:"))
+        old_stop = self.button(started, "stop:")
+        visit = self.store.get_visit_summary(guest.id).active
+        current = self.store.get_guest(guest.id)
+        await self.callback(f"field:entry_status:{guest.id}:{current.version}", user_id=102)
+        await self.message(main.ENTRY_CLOSED, user_id=102)
+        changed = await self.message("Вход закрыт со следующего посещения", user_id=102)
+        self.assertEqual("closed", self.store.get_guest(guest.id).entry_status)
+        self.assertEqual(visit.id, self.store.get_visit_summary(guest.id).active.id)
+        self.assertEqual(old_stop, self.button(changed, "stop:"))
+        await self.callback(old_stop, user_id=103)
+        self.assertIsNone(self.store.get_visit_summary(guest.id).active)
+        self.assertEqual(1, self.store.get_visit_summary(guest.id).completed_count)
 
     async def test_search_selection_and_name_edit_are_visible_to_all_staff(self):
         guest = self.seed()
@@ -211,6 +396,7 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
             await self.message(main.FIND, user_id=user_id, group=group)
             await self.message("Иван", user_id=user_id, group=group)
             for data in (f"view:{guest.id}", f"edit:{guest.id}:1", f"field:name:{guest.id}:1",
+                         f"field:entry_status:{guest.id}:1", f"field:entry_reason:{guest.id}:1",
                          f"delete:{guest.id}:1", f"remove:{guest.id}:1:forged", "save:forged"):
                 denied = await self.callback(data, user_id=user_id, group=group)
                 self.assertFalse(any(isinstance(call, SendPhoto) for call in denied))

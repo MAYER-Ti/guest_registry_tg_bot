@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
-from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -19,6 +19,8 @@ from aiogram.types import (
 )
 
 from config import Config, load_config
+from excel_export import build_guest_workbook, prepare_photo_thumbnail
+from reporting import ReportError, report_snapshot
 from storage import (
     DuplicatePhoneError, Guest, StaleGuestError, Store, VisitStateError,
     VisitSummary, normalize_phone,
@@ -26,6 +28,9 @@ from storage import (
 
 ADD = "➕ Добавить гостя"
 FIND = "🔎 Найти гостя"
+TOTAL = "👥 Всего гостей"
+BLACKLIST = "⛔ Чёрный список"
+EXPORT = "📊 Выгрузить в Excel"
 CANCEL = "Отмена"
 ENTRY_OPEN = "🟢 Вход открыт"
 ENTRY_CLOSED = "🔴 Вход закрыт"
@@ -35,8 +40,11 @@ PAGE_SIZE = 8
 VISIT_PAGE_SIZE = 5
 MOSCOW = timezone(timedelta(hours=3))
 MAX_PHOTO = 10 * 1024 * 1024
+MAX_EXPORT_BYTES = 49 * 1024 * 1024
 MENU = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text=ADD), KeyboardButton(text=FIND)]],
+    keyboard=[[KeyboardButton(text=ADD), KeyboardButton(text=FIND)],
+              [KeyboardButton(text=TOTAL), KeyboardButton(text=BLACKLIST)],
+              [KeyboardButton(text=EXPORT)]],
     resize_keyboard=True,
 )
 CANCEL_MENU = ReplyKeyboardMarkup(
@@ -265,6 +273,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
     guard = StaffOnly(config.allowed_user_ids)
     router.message.outer_middleware(guard)
     router.callback_query.outer_middleware(guard)
+    export_lock = asyncio.Lock()
 
     @router.message(CommandStart())
     @router.message(Command("help"))
@@ -274,6 +283,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
             "Общая база гостей. Выбери действие.\n"
             "В карточке можно изменить фото, телефон, имя, комментарий, статус входа и причину.\n"
             "Гость пришёл — нажми «Старт», ушёл — «Стоп». Время всех визитов суммируется.\n"
+            "В меню доступны количество гостей, чёрный список и полная выгрузка в Excel.\n"
             "Прервать действие: /cancel.", reply_markup=MENU,
         )
 
@@ -282,6 +292,108 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
     async def cancel(message: Message, state: FSMContext):
         await state.clear()
         await message.answer("Действие отменено.", reply_markup=MENU)
+
+    async def report_failed(message: Message, error: ReportError):
+        logging.getLogger(__name__).warning("Guest report failed (%s)", type(error).__name__)
+        await message.answer(
+            "Не удалось получить полный отчёт: одна из подключённых баз недоступна "
+            "или содержит данные другого формата. Проверь подключение баз и попробуй ещё раз.",
+            reply_markup=MENU, protect_content=True,
+        )
+
+    @router.message(Command("count"))
+    @router.message(F.text.in_({TOTAL, "Всего гостей"}))
+    async def total_guests(message: Message, state: FSMContext):
+        await state.clear()
+        try:
+            report = await asyncio.to_thread(report_snapshot, store, config.extra_db_paths)
+        except ReportError as error:
+            await report_failed(message, error)
+            return
+        await message.answer(
+            f"Всего гостей: {report.total_count}", reply_markup=MENU, protect_content=True,
+        )
+
+    @router.message(Command("blacklist"))
+    @router.message(F.text.in_({BLACKLIST, "Чёрный список"}))
+    async def blacklist(message: Message, state: FSMContext):
+        await state.clear()
+        try:
+            report = await asyncio.to_thread(report_snapshot, store, config.extra_db_paths)
+        except ReportError as error:
+            await report_failed(message, error)
+            return
+        closed = report.blacklist
+        if not closed:
+            await message.answer("Чёрный список пуст. Гостей со статусом «Вход закрыт» нет.",
+                                 reply_markup=MENU, protect_content=True)
+            return
+        lines = [f"⛔ Чёрный список — гостей: {len(closed)}"]
+        for index, row in enumerate(closed, 1):
+            guest = row.guest
+            source = f" · {row.source_name}" if len(report.sources) > 1 else ""
+            lines.append(
+                f"\n{index}. {guest.name}{source}\nТелефон: {guest.phone}\n"
+                f"Статус: Вход закрыт\nПричина: {guest.entry_reason or '—'}"
+            )
+        chunks = text_chunks("\n".join(lines))
+        for index, chunk in enumerate(chunks):
+            while True:
+                try:
+                    await message.answer(
+                        chunk, reply_markup=MENU if index == len(chunks) - 1 else None,
+                        protect_content=True,
+                    )
+                    break
+                except TelegramRetryAfter as error:
+                    # Retry the same part; a rate limit must not skip guests.
+                    await asyncio.sleep(max(0, error.retry_after) + 0.1)
+            if index < len(chunks) - 1:
+                await asyncio.sleep(1.05)
+
+    async def send_export(message: Message):
+        try:
+            report = await asyncio.to_thread(
+                report_snapshot, store, config.extra_db_paths, include_photos=True,
+                photo_transform=prepare_photo_thumbnail,
+            )
+            content = await asyncio.to_thread(build_guest_workbook, report)
+        except ReportError as error:
+            await report_failed(message, error)
+            return
+        except (OSError, ValueError, RuntimeError) as error:
+            logging.getLogger(__name__).warning("Excel creation failed (%s)", type(error).__name__)
+            await message.answer("Не удалось подготовить Excel. Попробуй ещё раз.", reply_markup=MENU)
+            return
+        if len(content) > MAX_EXPORT_BYTES:
+            await message.answer(
+                "Полная выгрузка превышает размер файла, который можно отправить через Telegram. "
+                "Карточки не обрезаны. Обратись к владельцу, чтобы получить полный файл другим способом.",
+                reply_markup=MENU, protect_content=True,
+            )
+            return
+        exported_at = report.generated_at.astimezone(MOSCOW)
+        filename = f"guests-{exported_at:%Y%m%d-%H%M%S}.xlsx"
+        try:
+            await message.answer_document(
+                document=BufferedInputFile(content, filename=filename),
+                caption=(f"Карточек: {report.total_count}. Баз: {len(report.sources)}.\n"
+                         f"Выгрузка на {exported_at:%d.%m.%Y %H:%M:%S} МСК."),
+                reply_markup=MENU, protect_content=True,
+            )
+        except (TelegramBadRequest, TelegramNetworkError):
+            await message.answer("Не удалось отправить файл. Нажми «Выгрузить в Excel» ещё раз.",
+                                 reply_markup=MENU)
+
+    @router.message(Command("export"))
+    @router.message(F.text.in_({EXPORT, "Выгрузить в Excel"}))
+    async def export_guests(message: Message, state: FSMContext):
+        await state.clear()
+        await message.answer("Готовлю Excel со всеми карточками гостей…", reply_markup=MENU,
+                             protect_content=True)
+        # Keep only one workbook in flight, including the Telegram upload.
+        async with export_lock:
+            await send_export(message)
 
     @router.message(F.text == ADD)
     async def add_start(message: Message, state: FSMContext):
@@ -723,7 +835,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
 
     @router.message()
     async def unknown_message(message: Message):
-        await message.answer("Выбери «Добавить гостя» или «Найти гостя».", reply_markup=MENU)
+        await message.answer("Выбери действие в меню.", reply_markup=MENU)
 
     dispatcher.include_router(router)
     return dispatcher

@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from config import ConfigError, get_db_path, load_config
+from config import Config, ConfigError, get_db_path, get_extra_db_paths, load_config
 
 
 TOKEN = "123456789:" + "A" * 35
@@ -61,6 +61,30 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(environment=environment), patch.dict(os.environ, environment, clear=True):
                 with self.assertRaises(ConfigError):
                     get_db_path()
+
+    def test_extra_databases_default_empty_and_config_stays_backward_compatible(self):
+        self.assertEqual(Config(TOKEN, frozenset({10}), Path("primary.sqlite3")).extra_db_paths, ())
+        with patch.dict(os.environ, {"BOT_TOKEN": TOKEN, "ALLOWED_USER_IDS": "10"}, clear=True):
+            self.assertEqual(get_extra_db_paths(), ())
+            self.assertEqual(load_config().extra_db_paths, ())
+
+    def test_extra_databases_json_preserves_spaces_and_path_separators(self):
+        raw = '[" /app/data/extra guests.sqlite3 ", "C:\\\\data\\\\extra.sqlite3"]'
+        with patch.dict(os.environ, {"BOT_TOKEN": TOKEN, "ALLOWED_USER_IDS": "10", "EXTRA_DB_PATHS": raw}, clear=True):
+            config = load_config()
+        self.assertEqual(config.extra_db_paths, (Path("/app/data/extra guests.sqlite3"),
+                                                Path("C:\\data\\extra.sqlite3")))
+        self.assertNotIn("extra guests", repr(config))
+        with patch.dict(os.environ, {"EXTRA_DB_PATHS": "[]"}, clear=True):
+            self.assertEqual(get_extra_db_paths(), ())
+
+    def test_invalid_extra_databases_are_rejected_without_echoing_value(self):
+        for raw in ("", " ", "not-json-secret", '"secret-path"', "{}", "null", '[null]',
+                    '[5]', '[""]', '["   "]', '[":memory:"]', '["bad\\u0000path"]'):
+            with self.subTest(raw=raw), patch.dict(os.environ, {"EXTRA_DB_PATHS": raw}, clear=True):
+                with self.assertRaises(ConfigError) as raised:
+                    get_extra_db_paths()
+                self.assertNotIn("secret", str(raised.exception))
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
@@ -19,8 +20,10 @@ from aiogram.types import (
 )
 
 from config import Config, load_config
+from activity import active_guests, calculate_stats
 from excel_export import build_guest_workbook, prepare_photo_thumbnail
 from reporting import ReportError, report_snapshot
+from reminders import reminder_loop
 from storage import (
     DuplicatePhoneError, Guest, StaleGuestError, Store, VisitStateError,
     VisitSummary, normalize_phone,
@@ -31,6 +34,9 @@ FIND = "🔎 Найти гостя"
 TOTAL = "👥 Всего гостей"
 BLACKLIST = "⛔ Чёрный список"
 EXPORT = "📊 Выгрузить в Excel"
+STATS = "📈 Статистика"
+PRESENT = "🟢 Сейчас в заведении"
+AUDIT = "📜 История изменений"
 CANCEL = "Отмена"
 ENTRY_OPEN = "🟢 Вход открыт"
 ENTRY_CLOSED = "🔴 Вход закрыт"
@@ -38,13 +44,15 @@ NO_REASON = "Без причины"
 ENTRY_LABELS = {"open": ENTRY_OPEN, "closed": ENTRY_CLOSED}
 PAGE_SIZE = 8
 VISIT_PAGE_SIZE = 5
+AUDIT_PAGE_SIZE = 5
 MOSCOW = timezone(timedelta(hours=3))
 MAX_PHOTO = 10 * 1024 * 1024
 MAX_EXPORT_BYTES = 49 * 1024 * 1024
 MENU = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text=ADD), KeyboardButton(text=FIND)],
               [KeyboardButton(text=TOTAL), KeyboardButton(text=BLACKLIST)],
-              [KeyboardButton(text=EXPORT)]],
+              [KeyboardButton(text=PRESENT), KeyboardButton(text=STATS)],
+              [KeyboardButton(text=AUDIT), KeyboardButton(text=EXPORT)]],
     resize_keyboard=True,
 )
 CANCEL_MENU = ReplyKeyboardMarkup(
@@ -100,6 +108,7 @@ def card_actions(guest: Guest, summary: VisitSummary) -> InlineKeyboardMarkup:
     return keyboard([
         [timer, ("🔄 Обновить время", f"view:{guest.id}")],
         [("🕒 История посещений", f"history:{guest.id}:0")],
+        [(AUDIT, f"audit:{guest.id}:0")],
         [("✏️ Изменить", f"edit:{key}"), ("🗑 Удалить", f"delete:{key}")],
     ])
 
@@ -174,9 +183,63 @@ def text_chunks(value: str, max_units: int = 4000) -> list[str]:
     return chunks
 
 
+async def answer_parts(message: Message, text: str, *, reply_markup=None) -> None:
+    chunks = text_chunks(text)
+    for index, chunk in enumerate(chunks):
+        while True:
+            try:
+                await message.answer(chunk, protect_content=True,
+                                     reply_markup=reply_markup if index == len(chunks) - 1 else None)
+                break
+            except TelegramRetryAfter as error:
+                await asyncio.sleep(max(0, error.retry_after) + 0.1)
+        if index < len(chunks) - 1:
+            await asyncio.sleep(1.05)
+
+
+def callback_number(value: str, *, positive: bool = False) -> bool:
+    return (value.isascii() and value.isdigit() and len(value) <= 19
+            and (1 if positive else 0) <= int(value) <= 2**63 - 1)
+
+
+AUDIT_ACTIONS = {"add": "Создана карточка", "update": "Изменена карточка",
+                 "delete": "Удалена карточка", "start": "Запущен таймер",
+                 "stop": "Остановлен таймер"}
+AUDIT_FIELDS = {"name": "Имя", "phone": "Телефон", "comment": "Комментарий",
+                "photo": "Фото", "entry_status": "Статус входа", "entry_reason": "Причина",
+                "visit_id": "Номер визита", "started_at": "Начало визита", "stopped_at": "Конец визита"}
+
+
+def audit_text(event, actor_label: str, *, compact: bool = True) -> str:
+    def value_text(field, value):
+        if value is None or value == "":
+            return "—"
+        if field == "entry_status":
+            return {"open": "Вход открыт", "closed": "Вход закрыт"}.get(value, str(value))
+        if field in {"started_at", "stopped_at"}:
+            return format_visit_time(str(value)) + " МСК"
+        value = str(value)
+        if compact:
+            value = " ".join(value.split())
+            if len(value) > 140:
+                value = value[:140] + "…"
+        return value
+
+    actor = (f"{actor_label} · ID {event.actor_id}" if event.actor_id
+             and not actor_label.startswith("Telegram ID ") else actor_label)
+    lines = [f"#{event.id} · {format_visit_time(event.created_at)} МСК",
+             f"{AUDIT_ACTIONS.get(event.action, event.action)}: {event.guest_name} (№{event.guest_id})",
+             f"Сотрудник: {actor}"]
+    for field, change in event.changes.items():
+        before, after = change.get("before"), change.get("after")
+        lines.append(f"{AUDIT_FIELDS.get(field, field)}: {value_text(field, before)} → {value_text(field, after)}")
+    return "\n".join(lines)
+
+
 class StaffOnly(BaseMiddleware):
-    def __init__(self, allowed: frozenset[int]):
+    def __init__(self, allowed: frozenset[int], store: Store):
         self.allowed = allowed
+        self.store = store
 
     async def __call__(self, handler, event, data):
         user = event.from_user
@@ -193,6 +256,7 @@ class StaffOnly(BaseMiddleware):
             elif private:
                 await event.answer("Доступ только для сотрудников. Твой ID: " + str(user.id))
             return
+        await asyncio.to_thread(self.store.remember_staff, user.id, user.full_name, user.username)
         return await handler(event, data)
 
 
@@ -270,7 +334,7 @@ async def show_guest(message: Message, guest: Guest, store: Store) -> None:
 def build_dispatcher(config: Config, store: Store) -> Dispatcher:
     dispatcher = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
     router = Router()
-    guard = StaffOnly(config.allowed_user_ids)
+    guard = StaffOnly(config.allowed_user_ids, store)
     router.message.outer_middleware(guard)
     router.callback_query.outer_middleware(guard)
     export_lock = asyncio.Lock()
@@ -284,6 +348,8 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
             "В карточке можно изменить фото, телефон, имя, комментарий, статус входа и причину.\n"
             "Гость пришёл — нажми «Старт», ушёл — «Стоп». Время всех визитов суммируется.\n"
             "В меню доступны количество гостей, чёрный список и полная выгрузка в Excel.\n"
+            "Также доступны статистика, история изменений и список гостей в заведении.\n"
+            "Если таймер работает 24 часа, я напомню сотруднику, который его запустил.\n"
             "Прервать действие: /cancel.", reply_markup=MENU,
         )
 
@@ -394,6 +460,159 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         # Keep only one workbook in flight, including the Telegram upload.
         async with export_lock:
             await send_export(message)
+
+    async def statistics_page(message: Message, period: str):
+        try:
+            report = await asyncio.to_thread(report_snapshot, store, config.extra_db_paths)
+        except ReportError as error:
+            await report_failed(message, error)
+            return
+        stats = calculate_stats(report, period)
+        start_at, end_at = stats.start.astimezone(MOSCOW), stats.end.astimezone(MOSCOW)
+        lines = [f"📈 Статистика · {stats.label.lower()}",
+                 f"{start_at:%d.%m.%Y %H:%M} — {end_at:%d.%m.%Y %H:%M} МСК",
+                 f"Посещений: {stats.visit_count}", f"Уникальных гостей: {stats.unique_guests}",
+                 f"Общее время: {format_duration(stats.total_seconds)}",
+                 "\nСамые частые посетители:"]
+        for index, ranked in enumerate(stats.top, 1):
+            guest = ranked.row.guest
+            source = f" · {ranked.row.source_name}" if len(report.sources) > 1 else ""
+            lines.append(f"{index}. {guest.name} · {guest.phone}{source}\n"
+                         f"Посещений: {ranked.visit_count} · {format_duration(ranked.total_seconds)}")
+        if not stats.top:
+            lines.append("Новых посещений за этот период нет.")
+        lines.append("\nПосещения и уникальные гости считаются по времени прихода. "
+                     "Общее время — только в пределах периода, включая текущие визиты.")
+        await answer_parts(message, "\n".join(lines), reply_markup=keyboard([
+            [("День", "stats:day"), ("Неделя", "stats:week"), ("Месяц", "stats:month")],
+            [("🔄 Обновить", f"stats:{period}")],
+        ]))
+
+    @router.message(Command("stats"))
+    @router.message(F.text.in_({STATS, "Статистика"}))
+    async def statistics(message: Message, state: FSMContext):
+        await state.clear()
+        await message.answer("Выбери период статистики.", reply_markup=MENU)
+        await statistics_page(message, "day")
+
+    @router.callback_query(F.data.startswith("stats:"))
+    async def statistics_period(query: CallbackQuery, state: FSMContext):
+        period = query.data.split(":")
+        if len(period) != 2 or period[1] not in {"day", "week", "month"}:
+            await query.answer("Некорректный период.", show_alert=True)
+            return
+        await query.answer()
+        await state.clear()
+        await statistics_page(query.message, period[1])
+
+    async def present_page(message: Message, offset: int = 0):
+        # Primary cards are editable; extra reporting sources stay read-only.
+        try:
+            report = await asyncio.to_thread(report_snapshot, store)
+        except ReportError as error:
+            await report_failed(message, error)
+            return
+        active = active_guests(report)
+        offset = min(offset, max(0, (len(active) - 1) // PAGE_SIZE * PAGE_SIZE))
+        page = active[offset:offset + PAGE_SIZE]
+        lines = [f"🟢 Сейчас в заведении: {len(active)}", "Время указано по Москве (МСК)."]
+        rows = []
+        for index, row in enumerate(page, offset + 1):
+            guest, summary = row.guest, row.summary
+            lines.append(f"\n{index}. {guest.name} · {guest.phone}\n"
+                         f"Пришёл: {format_visit_time(summary.active.started_at)}\n"
+                         f"Уже у нас: {format_duration(summary.current_seconds)}")
+            rows.append([(f"{index}. Карточка", f"view:{guest.id}"),
+                         (f"{index}. ⏹ Стоп", f"stop:{guest.id}:{summary.active.id}")])
+        if not active:
+            lines.append("\nГостей с запущенным таймером нет.")
+        navigation = []
+        if offset:
+            navigation.append(("← Назад", f"present:{max(0, offset - PAGE_SIZE)}"))
+        if offset + PAGE_SIZE < len(active):
+            navigation.append(("Далее →", f"present:{offset + PAGE_SIZE}"))
+        if navigation:
+            rows.append(navigation)
+        rows.append([("🔄 Обновить список", f"present:{offset}")])
+        await answer_parts(message, "\n".join(lines), reply_markup=keyboard(rows))
+
+    @router.message(Command("present"))
+    @router.message(F.text.in_({PRESENT, "Сейчас в заведении"}))
+    async def present(message: Message, state: FSMContext):
+        await state.clear()
+        await message.answer("Гости с активным таймером:", reply_markup=MENU)
+        await present_page(message)
+
+    @router.callback_query(F.data.startswith("present:"))
+    async def present_navigation(query: CallbackQuery, state: FSMContext):
+        parts = query.data.split(":")
+        if len(parts) != 2 or not callback_number(parts[1]):
+            await query.answer("Некорректная страница.", show_alert=True)
+            return
+        await query.answer()
+        await state.clear()
+        await present_page(query.message, int(parts[1]))
+
+    async def audit_page(message: Message, guest_id: int | None = None, offset: int = 0):
+        total = await asyncio.to_thread(store.count_audit, guest_id)
+        offset = min(offset, max(0, (total - 1) // AUDIT_PAGE_SIZE * AUDIT_PAGE_SIZE))
+        events = await asyncio.to_thread(store.list_audit, guest_id, AUDIT_PAGE_SIZE, offset)
+        scope = str(guest_id) if guest_id else "all"
+        title = f"📜 История изменений · карточка №{guest_id}" if guest_id else AUDIT
+        lines = [title, "История ведётся с момента включения функции."]
+        rows = []
+        for event in events:
+            label = await asyncio.to_thread(store.staff_label, event.actor_id) if event.actor_id else "Не указан"
+            lines.append("\n" + audit_text(event, label))
+            rows.append([(f"Подробнее · #{event.id}", f"auditdetail:{event.id}")])
+        if not events:
+            lines.append("\nИзменений пока нет.")
+        navigation = []
+        if offset:
+            navigation.append(("← Назад", f"audit:{scope}:{max(0, offset - AUDIT_PAGE_SIZE)}"))
+        if offset + AUDIT_PAGE_SIZE < total:
+            navigation.append(("Далее →", f"audit:{scope}:{offset + AUDIT_PAGE_SIZE}"))
+        if navigation:
+            rows.append(navigation)
+        rows.append([("🔄 Обновить историю", f"audit:{scope}:0")])
+        if guest_id:
+            rows.append([("К карточке", f"view:{guest_id}")])
+        await answer_parts(message, "\n".join(lines), reply_markup=keyboard(rows))
+
+    @router.message(Command("audit"))
+    @router.message(F.text.in_({AUDIT, "История изменений"}))
+    async def audit_history(message: Message, state: FSMContext):
+        await state.clear()
+        await message.answer("Журнал действий сотрудников:", reply_markup=MENU)
+        await audit_page(message)
+
+    @router.callback_query(F.data.startswith("audit:"))
+    async def audit_navigation(query: CallbackQuery, state: FSMContext):
+        parts = query.data.split(":")
+        if (len(parts) != 3 or not callback_number(parts[2]) or
+                not (parts[1] == "all" or callback_number(parts[1], positive=True))):
+            await query.answer("Некорректная страница.", show_alert=True)
+            return
+        await query.answer()
+        await state.clear()
+        await audit_page(query.message, None if parts[1] == "all" else int(parts[1]), int(parts[2]))
+
+    @router.callback_query(F.data.startswith("auditdetail:"))
+    async def audit_detail(query: CallbackQuery, state: FSMContext):
+        parts = query.data.split(":")
+        if len(parts) != 2 or not callback_number(parts[1], positive=True):
+            await query.answer("Некорректная запись.", show_alert=True)
+            return
+        event = await asyncio.to_thread(store.get_audit, int(parts[1]))
+        if event is None:
+            await query.answer("Запись недоступна.", show_alert=True)
+            return
+        await query.answer()
+        await state.clear()
+        label = await asyncio.to_thread(store.staff_label, event.actor_id) if event.actor_id else "Не указан"
+        await answer_parts(query.message, audit_text(event, label, compact=False), reply_markup=keyboard([
+            [("История карточки", f"audit:{event.guest_id}:0"), ("Вся история", "audit:all:0")],
+        ]))
 
     @router.message(F.text == ADD)
     async def add_start(message: Message, state: FSMContext):
@@ -822,7 +1041,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
             return
         await query.answer()
         try:
-            await asyncio.to_thread(store.delete_guest, guest.id, guest.version)
+            await asyncio.to_thread(store.delete_guest, guest.id, guest.version, query.from_user.id)
         except StaleGuestError:
             await query.message.answer("Карточка изменилась. Найди её заново.", reply_markup=MENU)
             return
@@ -849,7 +1068,13 @@ async def main() -> None:
         identity = await bot.get_me()
         logging.getLogger(__name__).info("Telegram connected: @%s (id=%s)", identity.username, identity.id)
         await bot.delete_webhook(drop_pending_updates=False)
-        await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
+        reminders = asyncio.create_task(reminder_loop(bot, store, config.allowed_user_ids))
+        try:
+            await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
+        finally:
+            reminders.cancel()
+            with suppress(asyncio.CancelledError):
+                await reminders
 
 
 if __name__ == "__main__":

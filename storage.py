@@ -11,6 +11,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 import re
@@ -85,6 +86,17 @@ class VisitSummary:
         return self.completed_seconds + self.current_seconds
 
 
+@dataclass(frozen=True, slots=True)
+class AuditEvent:
+    id: int
+    guest_id: int
+    guest_name: str
+    actor_id: int | None
+    action: str
+    changes: dict[str, object]
+    created_at: str
+
+
 def normalize_name(value: str) -> str:
     """Normalize Unicode, case, Russian ё, and whitespace for name lookup."""
     if not isinstance(value, str):
@@ -112,6 +124,41 @@ def normalize_phone(value: str) -> str:
 def _validate_actor(actor_id: int) -> None:
     if isinstance(actor_id, bool) or not isinstance(actor_id, int) or actor_id <= 0:
         raise ValueError("Некорректный Telegram ID сотрудника.")
+
+
+def _validate_identifier(value: int) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError("Некорректный идентификатор.")
+
+
+def _validate_page(limit: int, offset: int) -> None:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise ValueError("Размер страницы должен быть от 1 до 100.")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("Смещение должно быть неотрицательным целым числом.")
+
+
+def _card_changes(before: Guest | None, after: Guest | None) -> dict[str, object]:
+    changes: dict[str, object] = {}
+    for field in ("name", "phone", "comment", "entry_status", "entry_reason"):
+        old = getattr(before, field) if before else None
+        new = getattr(after, field) if after else None
+        if old != new:
+            changes[field] = {"before": old, "after": new}
+    if (before is None or after is None or before.photo != after.photo
+            or before.photo_file_id != after.photo_file_id):
+        # Audit data never duplicates photos or Telegram file identifiers.
+        changes["photo"] = {
+            "before": "Есть фото" if before else None,
+            "after": ("Новое фото" if before else "Есть фото") if after else None,
+        }
+    return changes
+
+
+def _audit_event(row: sqlite3.Row) -> AuditEvent:
+    return AuditEvent(id=row["id"], guest_id=row["guest_id"], guest_name=row["guest_name"],
+                      actor_id=row["actor_id"], action=row["action"],
+                      changes=json.loads(row["changes"]), created_at=row["created_at"])
 
 
 def _validate_fields(*, name: str, phone: str, comment: str, photo: bytes,
@@ -215,11 +262,14 @@ class Store:
             )}
             columns = {row[1] for row in connection.execute("PRAGMA table_info(guests)")}
             missing_entry_columns = {"entry_status", "entry_reason"} - columns
-            if "guests" in tables and ("visits" not in tables or missing_entry_columns):
+            missing_activity_tables = {"audit_events", "staff", "visit_reminders"} - tables
+            if "guests" in tables and ("visits" not in tables or missing_entry_columns
+                                       or missing_activity_tables):
                 # Back up old/partial schemas before any schema change. Run the
                 # online backup outside the transaction; failure aborts startup.
                 stamp = _utc_datetime().strftime("%Y%m%dT%H%M%S%fZ")
-                upgrade = "visits" if "visits" not in tables else "entry-status"
+                upgrade = ("visits" if "visits" not in tables else
+                           "entry-status" if missing_entry_columns else "activity")
                 self.backup(self.path.parent / "backups" /
                             f"guests-before-{upgrade}-{stamp}-{uuid4().hex}.sqlite3")
             connection.execute("BEGIN IMMEDIATE")
@@ -277,6 +327,37 @@ class Store:
                 CREATE INDEX IF NOT EXISTS visits_guest_started
                 ON visits(guest_id, started_at DESC, id DESC)
             """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS audit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guest_id INTEGER NOT NULL,
+                    guest_name TEXT NOT NULL,
+                    actor_id INTEGER,
+                    action TEXT NOT NULL CHECK (action IN ('add', 'update', 'delete', 'start', 'stop')),
+                    changes TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            connection.execute("""
+                CREATE INDEX IF NOT EXISTS audit_events_guest_id
+                ON audit_events(guest_id, id DESC)
+            """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS staff (
+                    actor_id INTEGER PRIMARY KEY CHECK (actor_id > 0),
+                    name TEXT NOT NULL,
+                    username TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS visit_reminders (
+                    visit_id INTEGER NOT NULL REFERENCES visits(id) ON DELETE CASCADE,
+                    recipient_id INTEGER NOT NULL CHECK (recipient_id > 0),
+                    sent_at TEXT NOT NULL,
+                    PRIMARY KEY (visit_id, recipient_id)
+                )
+            """)
             connection.commit()
         _restrict_permissions(self.path)
 
@@ -316,6 +397,9 @@ class Store:
                     raise DuplicatePhoneError("Гость с таким телефоном уже есть.") from exc
                 raise
             result = _guest(connection.execute("SELECT * FROM guests WHERE id = ?", (cursor.lastrowid,)).fetchone())
+            assert result is not None
+            self._record_audit(connection, result.id, result.name, actor_id, "add",
+                               _card_changes(None, result), now)
         assert result is not None
         return result
 
@@ -378,16 +462,26 @@ class Store:
                     raise DuplicatePhoneError("Гость с таким телефоном уже есть.") from exc
                 raise
             result = _guest(connection.execute("SELECT * FROM guests WHERE id = ?", (id,)).fetchone())
+            assert result is not None
+            self._record_audit(connection, result.id, result.name, actor_id, "update",
+                               _card_changes(current, result), result.updated_at)
         assert result is not None
         return result
 
-    def delete_guest(self, id: int, expected_version: int) -> bool:
+    def delete_guest(self, id: int, expected_version: int, actor_id: int | None = None) -> bool:
         """Return True when deleted; missing/stale cards raise StaleGuestError."""
+        if actor_id is not None:
+            _validate_actor(actor_id)
         with self._connection() as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
+            current = _guest(connection.execute("SELECT * FROM guests WHERE id = ?", (id,)).fetchone())
+            if current is None or current.version != expected_version:
+                raise StaleGuestError("Карточка уже изменена или удалена. Откройте её заново.")
             cursor = connection.execute("DELETE FROM guests WHERE id = ? AND version = ?", (id, expected_version))
             if cursor.rowcount != 1:
                 raise StaleGuestError("Карточка уже изменена или удалена. Откройте её заново.")
+            self._record_audit(connection, current.id, current.name, actor_id, "delete",
+                               _card_changes(current, None), _timestamp())
         return True
 
     def start_visit(self, guest_id: int, expected_version: int, actor_id: int,
@@ -396,7 +490,7 @@ class Store:
         _validate_actor(actor_id)
         with self._connection() as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
-            guest = connection.execute("SELECT version FROM guests WHERE id = ?", (guest_id,)).fetchone()
+            guest = connection.execute("SELECT version, name FROM guests WHERE id = ?", (guest_id,)).fetchone()
             if guest is None or guest["version"] != expected_version:
                 raise StaleGuestError("Карточка уже изменена или удалена. Откройте её заново.")
             if connection.execute(
@@ -418,6 +512,11 @@ class Store:
                 WHERE id = ?
             """, (started_at, actor_id, guest_id))
             result = _visit(connection.execute("SELECT * FROM visits WHERE id = ?", (cursor.lastrowid,)).fetchone())
+            assert result is not None
+            self._record_audit(connection, guest_id, guest["name"], actor_id, "start", {
+                "visit_id": {"before": None, "after": result.id},
+                "started_at": {"before": None, "after": started_at},
+            }, started_at)
         assert result is not None
         return result
 
@@ -445,6 +544,11 @@ class Store:
                 WHERE id = ?
             """, (stopped_at, actor_id, guest_id))
             result = _visit(connection.execute("SELECT * FROM visits WHERE id = ?", (visit_id,)).fetchone())
+            guest_name = connection.execute("SELECT name FROM guests WHERE id = ?", (guest_id,)).fetchone()[0]
+            self._record_audit(connection, guest_id, guest_name, actor_id, "stop", {
+                "visit_id": {"before": visit_id, "after": visit_id},
+                "stopped_at": {"before": None, "after": stopped_at},
+            }, stopped_at)
         assert result is not None
         return result
 
@@ -483,6 +587,126 @@ class Store:
                 ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?
             """, (guest_id, limit, offset)).fetchall()
         return [_visit(row) for row in rows]  # type: ignore[misc]
+
+    def _record_audit(self, connection: sqlite3.Connection, guest_id: int, guest_name: str,
+                      actor_id: int | None, action: str, changes: dict[str, object],
+                      created_at: str) -> None:
+        """Called in the same write transaction as the successful operation."""
+        connection.execute("""
+            INSERT INTO audit_events (guest_id, guest_name, actor_id, action, changes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (guest_id, guest_name, actor_id, action,
+              json.dumps(changes, ensure_ascii=False, separators=(",", ":")), created_at))
+
+    def list_audit(self, guest_id: int | None = None, limit: int = 5,
+                   offset: int = 0) -> list[AuditEvent]:
+        """Committed mutation order, newest first; deletion keeps this history."""
+        _validate_page(limit, offset)
+        if guest_id is not None:
+            _validate_identifier(guest_id)
+        where = " WHERE guest_id = ?" if guest_id is not None else ""
+        params = [guest_id] if guest_id is not None else []
+        with self._connection() as connection:
+            rows = connection.execute("SELECT * FROM audit_events" + where +
+                                      " ORDER BY id DESC LIMIT ? OFFSET ?",
+                                      [*params, limit, offset]).fetchall()
+        return [_audit_event(row) for row in rows]
+
+    def count_audit(self, guest_id: int | None = None) -> int:
+        if guest_id is not None:
+            _validate_identifier(guest_id)
+        where = " WHERE guest_id = ?" if guest_id is not None else ""
+        with self._connection() as connection:
+            return int(connection.execute("SELECT COUNT(*) FROM audit_events" + where,
+                                          [guest_id] if guest_id is not None else []).fetchone()[0])
+
+    def get_audit(self, event_id: int) -> AuditEvent | None:
+        _validate_identifier(event_id)
+        with self._connection() as connection:
+            row = connection.execute("SELECT * FROM audit_events WHERE id = ?", (event_id,)).fetchone()
+        return _audit_event(row) if row is not None else None
+
+    def remember_staff(self, actor_id: int, name: str, username: str | None = None) -> None:
+        """Remember names from authorized Telegram updates, never grant access."""
+        _validate_actor(actor_id)
+        if not isinstance(name, str) or not name.strip() or len(name) > 200 or "\x00" in name:
+            raise ValueError("Некорректное имя сотрудника.")
+        name = " ".join(name.split())
+        if username is None:
+            username = ""
+        if not isinstance(username, str):
+            raise ValueError("Некорректный Telegram username сотрудника.")
+        username = username.strip().removeprefix("@")
+        if username and not re.fullmatch(r"[A-Za-z0-9_]{1,64}", username):
+            raise ValueError("Некорректный Telegram username сотрудника.")
+        with self._connection() as connection, connection:
+            current = connection.execute("SELECT name, username FROM staff WHERE actor_id = ?",
+                                         (actor_id,)).fetchone()
+            if current and current["name"] == name and current["username"] == username:
+                return
+            connection.execute("""
+                INSERT INTO staff (actor_id, name, username, updated_at) VALUES (?, ?, ?, ?)
+                ON CONFLICT(actor_id) DO UPDATE SET name=excluded.name,
+                    username=excluded.username, updated_at=excluded.updated_at
+            """, (actor_id, name, username, _timestamp()))
+
+    def staff_label(self, actor_id: int | None) -> str:
+        if actor_id is None:
+            return "Сотрудник не указан"
+        _validate_actor(actor_id)
+        with self._connection() as connection:
+            row = connection.execute("SELECT name, username FROM staff WHERE actor_id = ?",
+                                     (actor_id,)).fetchone()
+        if row is None:
+            return f"Telegram ID {actor_id}"
+        return f'{row["name"]} (@{row["username"]})' if row["username"] else row["name"]
+
+    def overdue_visits(self, *, now: datetime | None = None,
+                       threshold_seconds: int = 86400) -> list[tuple[Guest, Visit]]:
+        """All active visits past the threshold; do not read photo BLOBs."""
+        if (isinstance(threshold_seconds, bool) or not isinstance(threshold_seconds, int)
+                or threshold_seconds <= 0):
+            raise ValueError("Порог напоминания должен быть положительным числом секунд.")
+        moment = _utc_datetime(now)
+        guest_columns = ", ".join("X'' AS guest_photo" if field == "photo"
+                                  else f"g.{field} AS guest_{field}"
+                                  for field in Guest.__dataclass_fields__)
+        visit_columns = ", ".join(f"v.{field} AS visit_{field}" for field in Visit.__dataclass_fields__)
+        with self._connection() as connection:
+            rows = connection.execute(f"""
+                SELECT {guest_columns}, {visit_columns} FROM visits AS v
+                JOIN guests AS g ON g.id = v.guest_id
+                WHERE v.stopped_at IS NULL ORDER BY v.started_at, v.id
+            """).fetchall()
+        results = []
+        for row in rows:
+            visit = Visit(**{field: row[f"visit_{field}"] for field in Visit.__dataclass_fields__})
+            if visit.duration_seconds(moment) >= threshold_seconds:
+                guest = Guest(**{field: row[f"guest_{field}"] for field in Guest.__dataclass_fields__})
+                results.append((guest, visit))
+        return results
+
+    def reminder_sent(self, visit_id: int, recipient_id: int) -> bool:
+        _validate_identifier(visit_id)
+        _validate_actor(recipient_id)
+        with self._connection() as connection:
+            return connection.execute("""
+                SELECT 1 FROM visit_reminders WHERE visit_id = ? AND recipient_id = ?
+            """, (visit_id, recipient_id)).fetchone() is not None
+
+    def mark_reminder_sent(self, visit_id: int, recipient_id: int,
+                           *, now: datetime | None = None) -> bool:
+        """Call only after successful sending; atomically ignore stopped visits."""
+        _validate_identifier(visit_id)
+        _validate_actor(recipient_id)
+        with self._connection() as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            sent_at = _timestamp(now)
+            cursor = connection.execute("""
+                INSERT OR IGNORE INTO visit_reminders (visit_id, recipient_id, sent_at)
+                SELECT id, ?, ? FROM visits WHERE id = ? AND stopped_at IS NULL
+            """, (recipient_id, sent_at, visit_id))
+            return cursor.rowcount == 1
 
     def backup(self, destination: Path | str) -> Path:
         """Write an atomic SQLite online backup, including every guest photo."""

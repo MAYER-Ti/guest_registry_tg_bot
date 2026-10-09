@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -18,12 +19,17 @@ from aiogram.types import (
 )
 
 from config import Config, load_config
-from storage import DuplicatePhoneError, Guest, StaleGuestError, Store, normalize_phone
+from storage import (
+    DuplicatePhoneError, Guest, StaleGuestError, Store, VisitStateError,
+    VisitSummary, normalize_phone,
+)
 
 ADD = "➕ Добавить гостя"
 FIND = "🔎 Найти гостя"
 CANCEL = "Отмена"
 PAGE_SIZE = 8
+VISIT_PAGE_SIZE = 5
+MOSCOW = timezone(timedelta(hours=3))
 MAX_PHOTO = 10 * 1024 * 1024
 MENU = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text=ADD), KeyboardButton(text=FIND)]],
@@ -65,9 +71,42 @@ def keyboard(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
     ])
 
 
-def card_actions(guest: Guest) -> InlineKeyboardMarkup:
+def card_actions(guest: Guest, summary: VisitSummary) -> InlineKeyboardMarkup:
     key = f"{guest.id}:{guest.version}"
-    return keyboard([[('✏️ Изменить', f'edit:{key}'), ('🗑 Удалить', f'delete:{key}')]])
+    timer = ("⏹ Стоп", f"stop:{guest.id}:{summary.active.id}") if summary.active else ("▶️ Старт", f"start:{key}")
+    return keyboard([
+        [timer, ("🔄 Обновить время", f"view:{guest.id}")],
+        [("🕒 История посещений", f"history:{guest.id}:0")],
+        [("✏️ Изменить", f"edit:{key}"), ("🗑 Удалить", f"delete:{key}")],
+    ])
+
+
+def format_duration(seconds: int) -> str:
+    hours, remainder = divmod(max(0, seconds), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours} ч. {minutes:02d} мин. {seconds:02d} сек."
+
+
+def format_visit_time(value: str) -> str:
+    return datetime.fromisoformat(value).astimezone(MOSCOW).strftime("%d.%m.%Y %H:%M:%S")
+
+
+def visit_details(summary: VisitSummary) -> str:
+    lines = ["🕒 Время посещений"]
+    if summary.active:
+        lines.extend([
+            "🟢 Сейчас в гостях",
+            f"Начало: {format_visit_time(summary.active.started_at)} МСК",
+            f"Текущий визит: {format_duration(summary.current_seconds)}",
+        ])
+    else:
+        lines.append("⚪ Сейчас не в гостях")
+    suffix = " (с текущим визитом)" if summary.active else ""
+    lines.extend([
+        f"Всего: {format_duration(summary.total_seconds)}{suffix}",
+        f"Завершённых визитов: {summary.completed_count}",
+    ])
+    return "\n".join(lines)
 
 
 def clean_name(value: str) -> str:
@@ -138,8 +177,11 @@ async def send_card(
     message: Message, *, name: str, phone: str, comment: str, photo: bytes,
     photo_file_id: str = "", title: str = "Карточка гостя",
     reply_markup: InlineKeyboardMarkup | None = None,
+    details: str = "",
 ) -> None:
     summary = f"{title}\n\nИмя: {name}\nТелефон: {phone}"
+    if details:
+        summary += "\n\n" + details
     full = f"{summary}\n\nКомментарий: {comment or '—'}"
     long_comment = len(full.encode("utf-16-le")) // 2 > 1024
     caption = summary if long_comment else full
@@ -166,11 +208,13 @@ async def send_card(
             )
 
 
-async def show_guest(message: Message, guest: Guest) -> None:
+async def show_guest(message: Message, guest: Guest, store: Store) -> None:
+    summary = await asyncio.to_thread(store.get_visit_summary, guest.id)
     await send_card(
         message, name=guest.name, phone=guest.phone, comment=guest.comment,
         photo=guest.photo, photo_file_id=guest.photo_file_id,
-        title=f"Карточка гостя №{guest.id}", reply_markup=card_actions(guest),
+        title=f"Карточка гостя №{guest.id}", reply_markup=card_actions(guest, summary),
+        details=visit_details(summary),
     )
 
 
@@ -188,6 +232,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         await message.answer(
             "Общая база гостей. Выбери действие.\n"
             "В карточке можно изменить фото, телефон, имя или комментарий.\n"
+            "Гость пришёл — нажми «Старт», ушёл — «Стоп». Время всех визитов суммируется.\n"
             "Прервать действие: /cancel.", reply_markup=MENU,
         )
 
@@ -301,7 +346,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
             return
         await state.clear()
         await query.message.answer("Гость сохранён в общей базе.", reply_markup=MENU)
-        await show_guest(query.message, guest)
+        await show_guest(query.message, guest, store)
 
     @router.message(AddGuest.confirm)
     async def confirmation_hint(message: Message):
@@ -320,7 +365,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
             if guest:
                 await state.clear()
                 await message.answer("Гость найден.", reply_markup=MENU)
-                await show_guest(message, guest)
+                await show_guest(message, guest, store)
             else:
                 await message.answer("Карточка только что удалена. Попробуй новый поиск.")
             return
@@ -370,9 +415,86 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         await state.clear()
         if guest:
             await query.message.answer("Карточка гостя:", reply_markup=MENU)
-            await show_guest(query.message, guest)
+            await show_guest(query.message, guest, store)
         else:
             await query.message.answer("Карточка уже удалена.", reply_markup=MENU)
+
+    @router.callback_query(F.data.startswith("start:"))
+    async def start_timer(query: CallbackQuery, state: FSMContext):
+        parts = query.data.split(":")
+        if len(parts) != 3 or not all(part.isdigit() and int(part) > 0 for part in parts[1:]):
+            await query.answer("Некорректная кнопка.", show_alert=True)
+            return
+        try:
+            await asyncio.to_thread(store.start_visit, int(parts[1]), int(parts[2]), query.from_user.id)
+        except (StaleGuestError, VisitStateError) as error:
+            await query.answer(str(error) + " Открой карточку заново.", show_alert=True)
+            return
+        await query.answer("Время пошло.")
+        await state.clear()
+        guest = await asyncio.to_thread(store.get_guest, int(parts[1]))
+        if guest:
+            await query.message.answer("▶️ Посещение начато. Когда гость уйдёт, нажми «Стоп».", reply_markup=MENU)
+            await show_guest(query.message, guest, store)
+        else:
+            await query.message.answer("Карточка уже удалена.", reply_markup=MENU)
+
+    @router.callback_query(F.data.startswith("stop:"))
+    async def stop_timer(query: CallbackQuery, state: FSMContext):
+        parts = query.data.split(":")
+        if len(parts) != 3 or not all(part.isdigit() and int(part) > 0 for part in parts[1:]):
+            await query.answer("Некорректная кнопка.", show_alert=True)
+            return
+        try:
+            visit = await asyncio.to_thread(store.stop_visit, int(parts[1]), int(parts[2]), query.from_user.id)
+        except (StaleGuestError, VisitStateError, ValueError) as error:
+            await query.answer(str(error) + " Обнови карточку.", show_alert=True)
+            return
+        await query.answer("Посещение сохранено.")
+        await state.clear()
+        guest = await asyncio.to_thread(store.get_guest, int(parts[1]))
+        if guest:
+            await query.message.answer(
+                "⏹ Посещение завершено: " + format_duration(visit.duration_seconds()) + ".\nВремя добавлено к общему.",
+                reply_markup=MENU,
+            )
+            await show_guest(query.message, guest, store)
+        else:
+            await query.message.answer("Карточка уже удалена.", reply_markup=MENU)
+
+    @router.callback_query(F.data.startswith("history:"))
+    async def visit_history(query: CallbackQuery, state: FSMContext):
+        parts = query.data.split(":")
+        if len(parts) != 3 or not parts[1].isdigit() or int(parts[1]) <= 0 or not parts[2].isdigit():
+            await query.answer("Некорректная кнопка.", show_alert=True)
+            return
+        guest_id, offset = int(parts[1]), int(parts[2])
+        guest = await asyncio.to_thread(store.get_guest, guest_id)
+        if not guest:
+            await query.answer("Карточка уже удалена.", show_alert=True)
+            return
+        visits = await asyncio.to_thread(store.list_visits, guest_id, VISIT_PAGE_SIZE + 1, offset)
+        await query.answer()
+        await state.clear()
+        lines = [f"История посещений: {guest.name}", "Время указано по Москве (МСК)."]
+        now = datetime.now(timezone.utc)
+        for visit in visits[:VISIT_PAGE_SIZE]:
+            end = format_visit_time(visit.stopped_at) if visit.stopped_at else "идёт сейчас"
+            lines.append(
+                f"\n{format_visit_time(visit.started_at)} → {end}\n"
+                f"Длительность: {format_duration(visit.duration_seconds(now))}"
+            )
+        if not visits:
+            lines.append("\nПосещений пока нет." if offset == 0 else "\nНа этой странице посещений нет.")
+        rows, navigation = [], []
+        if offset:
+            navigation.append(("← Назад", f"history:{guest_id}:{max(0, offset - VISIT_PAGE_SIZE)}"))
+        if len(visits) > VISIT_PAGE_SIZE:
+            navigation.append(("Далее →", f"history:{guest_id}:{offset + VISIT_PAGE_SIZE}"))
+        if navigation:
+            rows.append(navigation)
+        rows.append([("К карточке", f"view:{guest_id}")])
+        await query.message.answer("\n".join(lines), reply_markup=keyboard(rows), protect_content=True)
 
     async def current_guest(query: CallbackQuery, parts: list[str]) -> Guest | None:
         try:
@@ -454,7 +576,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
             return
         await state.clear()
         await message.answer("Карточка обновлена.", reply_markup=MENU)
-        await show_guest(message, guest)
+        await show_guest(message, guest, store)
 
     @router.callback_query(F.data.startswith("delete:"))
     async def ask_delete(query: CallbackQuery, state: FSMContext):
@@ -467,7 +589,8 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         await state.set_state(DeleteGuest.confirm)
         await state.update_data(delete_id=guest.id, delete_version=guest.version, delete_nonce=nonce)
         await query.message.answer(
-            f"Удалить карточку «{guest.name}» ({guest.phone}) из общей базы?",
+            f"Удалить карточку «{guest.name}» ({guest.phone}) из общей базы?\n"
+            "История посещений и текущий таймер тоже будут удалены.",
             reply_markup=keyboard([[("Да, удалить", f"remove:{guest.id}:{guest.version}:{nonce}"), ("Отмена", "cancel")]]),
             protect_content=True,
         )

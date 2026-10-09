@@ -18,6 +18,7 @@ import sqlite3
 import tempfile
 from typing import Iterator
 import unicodedata
+from uuid import uuid4
 
 
 MAX_PHOTO_BYTES = 10 * 1024 * 1024
@@ -31,6 +32,10 @@ class DuplicatePhoneError(ValueError):
 
 class StaleGuestError(RuntimeError):
     """The card was changed or deleted after the employee opened it."""
+
+
+class VisitStateError(RuntimeError):
+    """The requested visit is already active, stopped, or no longer exists."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +52,34 @@ class Guest:
     created_at: str
     updated_at: str
     version: int
+
+
+@dataclass(frozen=True, slots=True)
+class Visit:
+    id: int
+    guest_id: int
+    started_at: str
+    stopped_at: str | None
+    started_by: int
+    stopped_by: int | None
+
+    def duration_seconds(self, now: datetime | None = None) -> int:
+        """Whole elapsed seconds; active visits use the current UTC time."""
+        started = datetime.fromisoformat(self.started_at)
+        stopped = datetime.fromisoformat(self.stopped_at) if self.stopped_at else _utc_datetime(now)
+        return max(0, int((stopped - started).total_seconds()))
+
+
+@dataclass(frozen=True, slots=True)
+class VisitSummary:
+    active: Visit | None
+    completed_count: int
+    completed_seconds: int
+    current_seconds: int
+
+    @property
+    def total_seconds(self) -> int:
+        return self.completed_seconds + self.current_seconds
 
 
 def normalize_name(value: str) -> str:
@@ -111,14 +144,28 @@ def _restrict_permissions(path: Path, mode: int = 0o600) -> None:
         pass
 
 
-def _timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
+def _utc_datetime(now: datetime | None = None) -> datetime:
+    if now is None:
+        return datetime.now(timezone.utc)
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("Время должно содержать часовой пояс.")
+    return now.astimezone(timezone.utc)
+
+
+def _timestamp(now: datetime | None = None) -> str:
+    return _utc_datetime(now).isoformat(timespec="microseconds")
 
 
 def _guest(row: sqlite3.Row | None) -> Guest | None:
     if row is None:
         return None
     return Guest(**{field: row[field] for field in Guest.__dataclass_fields__})
+
+
+def _visit(row: sqlite3.Row | None) -> Visit | None:
+    if row is None:
+        return None
+    return Visit(**{field: row[field] for field in Visit.__dataclass_fields__})
 
 
 def _like_literal(value: str) -> str:
@@ -153,6 +200,17 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o777 if os.name == "nt" else 0o700)
         with self._connection() as connection:
             connection.execute("PRAGMA journal_mode=WAL")
+            tables = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )}
+            if "guests" in tables and "visits" not in tables:
+                # Protect real cards before the first upgrade. Run the online
+                # backup outside the schema transaction; a backup failure must
+                # abort startup without adding any schema or changing cards.
+                stamp = _utc_datetime().strftime("%Y%m%dT%H%M%S%fZ")
+                self.backup(self.path.parent / "backups" /
+                            f"guests-before-visits-{stamp}-{uuid4().hex}.sqlite3")
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS guests (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -170,6 +228,27 @@ class Store:
                     version INTEGER NOT NULL DEFAULT 1 CHECK (version > 0)
                 )
             """)
+            # Additive migration leaves every existing guest and photo intact.
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS visits (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guest_id INTEGER NOT NULL REFERENCES guests(id) ON DELETE CASCADE,
+                    started_at TEXT NOT NULL,
+                    stopped_at TEXT,
+                    started_by INTEGER NOT NULL,
+                    stopped_by INTEGER,
+                    CHECK ((stopped_at IS NULL) = (stopped_by IS NULL)),
+                    CHECK (stopped_at IS NULL OR stopped_at >= started_at)
+                )
+            """)
+            connection.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS visits_one_active_per_guest
+                ON visits(guest_id) WHERE stopped_at IS NULL
+            """)
+            connection.execute("""
+                CREATE INDEX IF NOT EXISTS visits_guest_started
+                ON visits(guest_id, started_at DESC, id DESC)
+            """)
             connection.commit()
         _restrict_permissions(self.path)
 
@@ -178,6 +257,7 @@ class Store:
         connection = sqlite3.connect(str(self.path), timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout=30000")
+        connection.execute("PRAGMA foreign_keys=ON")
         try:
             yield connection
         finally:
@@ -276,6 +356,100 @@ class Store:
             if cursor.rowcount != 1:
                 raise StaleGuestError("Карточка уже изменена или удалена. Откройте её заново.")
         return True
+
+    def start_visit(self, guest_id: int, expected_version: int, actor_id: int,
+                    *, now: datetime | None = None) -> Visit:
+        """Start one visit; old card buttons cannot start a later visit."""
+        _validate_actor(actor_id)
+        with self._connection() as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            guest = connection.execute("SELECT version FROM guests WHERE id = ?", (guest_id,)).fetchone()
+            if guest is None or guest["version"] != expected_version:
+                raise StaleGuestError("Карточка уже изменена или удалена. Откройте её заново.")
+            if connection.execute(
+                "SELECT 1 FROM visits WHERE guest_id = ? AND stopped_at IS NULL", (guest_id,)
+            ).fetchone() is not None:
+                raise VisitStateError("Отсчёт времени для этого гостя уже запущен.")
+            started_at = _timestamp(now)
+            try:
+                cursor = connection.execute("""
+                    INSERT INTO visits (guest_id, started_at, started_by)
+                    VALUES (?, ?, ?)
+                """, (guest_id, started_at, actor_id))
+            except sqlite3.IntegrityError as exc:
+                if "visits.guest_id" in str(exc):
+                    raise VisitStateError("Отсчёт времени для этого гостя уже запущен.") from exc
+                raise
+            connection.execute("""
+                UPDATE guests SET version = version + 1, updated_at = ?, updated_by = ?
+                WHERE id = ?
+            """, (started_at, actor_id, guest_id))
+            result = _visit(connection.execute("SELECT * FROM visits WHERE id = ?", (cursor.lastrowid,)).fetchone())
+        assert result is not None
+        return result
+
+    def stop_visit(self, guest_id: int, visit_id: int, actor_id: int,
+                   *, now: datetime | None = None) -> Visit:
+        """Stop the exact active visit; an old button never stops a new one."""
+        _validate_actor(actor_id)
+        with self._connection() as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = _visit(connection.execute("""
+                SELECT * FROM visits WHERE id = ? AND guest_id = ? AND stopped_at IS NULL
+            """, (visit_id, guest_id)).fetchone())
+            if current is None:
+                raise VisitStateError("Этот отсчёт уже завершён или удалён. Откройте карточку заново.")
+            stopped = _utc_datetime(now)
+            if stopped < datetime.fromisoformat(current.started_at):
+                raise ValueError("Время завершения не может быть раньше начала визита.")
+            stopped_at = _timestamp(stopped)
+            connection.execute("""
+                UPDATE visits SET stopped_at = ?, stopped_by = ?
+                WHERE id = ? AND guest_id = ? AND stopped_at IS NULL
+            """, (stopped_at, actor_id, visit_id, guest_id))
+            connection.execute("""
+                UPDATE guests SET version = version + 1, updated_at = ?, updated_by = ?
+                WHERE id = ?
+            """, (stopped_at, actor_id, guest_id))
+            result = _visit(connection.execute("SELECT * FROM visits WHERE id = ?", (visit_id,)).fetchone())
+        assert result is not None
+        return result
+
+    def get_visit_summary(self, guest_id: int, *, now: datetime | None = None) -> VisitSummary:
+        """Read a consistent total; missing/deleted guests have an empty total."""
+        moment = _utc_datetime(now)
+        with self._connection() as connection, connection:
+            # Keep both reads in one snapshot even when another employee stops
+            # or starts a visit between them.
+            connection.execute("BEGIN")
+            active = _visit(connection.execute("""
+                SELECT * FROM visits WHERE guest_id = ? AND stopped_at IS NULL
+            """, (guest_id,)).fetchone())
+            completed = connection.execute("""
+                SELECT started_at, stopped_at FROM visits
+                WHERE guest_id = ? AND stopped_at IS NOT NULL
+            """, (guest_id,)).fetchall()
+        # Python datetime arithmetic avoids SQLite julianday floating point
+        # rounding (an exact hour must never become 3,599 seconds).
+        completed_seconds = sum(max(0, int((datetime.fromisoformat(row["stopped_at"])
+                                            - datetime.fromisoformat(row["started_at"])).total_seconds()))
+                                for row in completed)
+        return VisitSummary(active=active, completed_count=len(completed),
+                            completed_seconds=completed_seconds,
+                            current_seconds=active.duration_seconds(moment) if active else 0)
+
+    def list_visits(self, guest_id: int, limit: int = 5, offset: int = 0) -> list[Visit]:
+        """Newest start first, including the current active visit if present."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("Размер страницы должен быть от 1 до 100.")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("Смещение должно быть неотрицательным целым числом.")
+        with self._connection() as connection:
+            rows = connection.execute("""
+                SELECT * FROM visits WHERE guest_id = ?
+                ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?
+            """, (guest_id, limit, offset)).fetchall()
+        return [_visit(row) for row in rows]  # type: ignore[misc]
 
     def backup(self, destination: Path | str) -> Path:
         """Write an atomic SQLite online backup, including every guest photo."""

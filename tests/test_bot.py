@@ -1,7 +1,7 @@
 """Telegram update tests with an in-memory API transport and a real database."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import shutil
 import unittest
@@ -272,6 +272,135 @@ class BotWorkflowTests(unittest.IsolatedAsyncioTestCase):
         expired = await self.callback(next_page)
         self.assertTrue(any(isinstance(call, AnswerCallbackQuery) and call.show_alert for call in expired))
         self.assertFalse(any(isinstance(call, SendMessage) and "Найдено:" in call.text for call in expired))
+
+    async def test_staff_share_one_visit_timer_and_record_who_started_and_stopped_it(self):
+        guest = self.seed()
+        idle = await self.callback(f"view:{guest.id}", user_id=101)
+        self.assertTrue(any(isinstance(call, SendPhoto) and "Сейчас не в гостях" in call.caption
+                            for call in idle))
+        start = self.button(idle, "start:")
+        await self.callback(start, user_id=101)
+        summary = self.store.get_visit_summary(guest.id)
+        self.assertIsNotNone(summary.active)
+        self.assertEqual(101, summary.active.started_by)
+        self.assertEqual(0, summary.completed_count)
+        shared = await self.callback(f"view:{guest.id}", user_id=104)
+        self.assertTrue(any(isinstance(call, SendPhoto) and "Сейчас в гостях" in call.caption
+                            and "Текущий визит:" in call.caption for call in shared))
+        stop = self.button(shared, "stop:")
+        await self.callback(stop, user_id=102)
+        finished = self.store.get_visit_summary(guest.id)
+        self.assertIsNone(finished.active)
+        self.assertEqual(1, finished.completed_count)
+        visit = self.store.list_visits(guest.id)[0]
+        self.assertEqual(101, visit.started_by)
+        self.assertEqual(102, visit.stopped_by)
+        self.assertIsNotNone(visit.stopped_at)
+        self.assertGreaterEqual(visit.duration_seconds(), 0)
+        self.assertEqual(visit.duration_seconds(), finished.total_seconds)
+
+    async def test_repeated_timer_actions_and_old_stop_cannot_create_or_end_another_visit(self):
+        guest = self.seed()
+        idle = await self.callback(f"view:{guest.id}")
+        start = self.button(idle, "start:")
+        started = await self.callback(start)
+        first_visit = self.store.get_visit_summary(guest.id).active
+        stop = self.button(started, "stop:")
+        await self.callback(start, user_id=102)
+        self.assertEqual(first_visit.id, self.store.get_visit_summary(guest.id).active.id)
+        self.assertEqual(1, len(self.store.list_visits(guest.id)))
+        stopped = await self.callback(stop)
+        await self.callback(stop, user_id=102)
+        await self.callback(start, user_id=102)  # Old start cannot begin a later visit.
+        self.assertIsNone(self.store.get_visit_summary(guest.id).active)
+        self.assertEqual(1, self.store.get_visit_summary(guest.id).completed_count)
+        self.assertEqual(1, len(self.store.list_visits(guest.id)))
+        new_start = self.button(stopped, "start:")
+        await self.callback(new_start, user_id=103)
+        new_visit = self.store.get_visit_summary(guest.id).active
+        self.assertNotEqual(first_visit.id, new_visit.id)
+        await self.callback(stop, user_id=104)
+        after_old_stop = self.store.get_visit_summary(guest.id)
+        self.assertEqual(new_visit.id, after_old_stop.active.id)
+        self.assertEqual(1, after_old_stop.completed_count)
+        self.assertEqual(2, len(self.store.list_visits(guest.id)))
+
+    async def test_edit_keeps_active_visit_and_existing_stop_still_targets_it(self):
+        guest = self.seed()
+        idle = await self.callback(f"view:{guest.id}")
+        started = await self.callback(self.button(idle, "start:"))
+        visit = self.store.get_visit_summary(guest.id).active
+        old_stop = self.button(started, "stop:")
+        edit_menu = await self.callback(self.button(started, "edit:"), user_id=102)
+        await self.callback(self.button(edit_menu, "field:name:"), user_id=102)
+        updated = await self.message("Пётр Петров", user_id=102)
+        self.assertEqual(visit.id, self.store.get_visit_summary(guest.id).active.id)
+        self.assertEqual("Пётр Петров", self.store.get_guest(guest.id).name)
+        self.assertEqual(old_stop, self.button(updated, "stop:"))
+        await self.callback(old_stop, user_id=103)
+        self.assertIsNone(self.store.get_visit_summary(guest.id).active)
+        self.assertEqual(103, self.store.list_visits(guest.id)[0].stopped_by)
+
+    async def test_timer_and_history_callbacks_are_denied_to_strangers_and_groups(self):
+        guest = self.seed()
+        start = self.button(await self.callback(f"view:{guest.id}"), "start:")
+        for user_id, group in ((999, False), (101, True)):
+            denied = await self.callback(start, user_id=user_id, group=group)
+            self.assertTrue(any(isinstance(call, AnswerCallbackQuery) and call.show_alert
+                                for call in denied))
+            self.assertFalse(any(isinstance(call, (SendPhoto, SendMessage)) for call in denied))
+        self.assertEqual([], self.store.list_visits(guest.id))
+        started = await self.callback(start)
+        stop = self.button(started, "stop:")
+        visit = self.store.get_visit_summary(guest.id).active
+        for user_id, group in ((999, False), (101, True)):
+            for action in (stop, f"history:{guest.id}:0"):
+                denied = await self.callback(action, user_id=user_id, group=group)
+                self.assertTrue(any(isinstance(call, AnswerCallbackQuery) and call.show_alert
+                                    for call in denied))
+                self.assertFalse(any(isinstance(call, (SendPhoto, SendMessage)) for call in denied))
+        self.assertEqual(visit.id, self.store.get_visit_summary(guest.id).active.id)
+        self.assertEqual(0, self.store.get_visit_summary(guest.id).completed_count)
+
+    async def test_visit_summary_is_visible_with_long_comment_and_more_than_24_hours(self):
+        comment = "😀" * 2500
+        guest = self.seed(comment=comment)
+        idle = await self.callback(f"view:{guest.id}")
+        await self.callback(self.button(idle, "start:"))
+        summary = self.store.get_visit_summary(guest.id)
+        later = datetime.fromisoformat(summary.active.started_at) + timedelta(seconds=90061)
+        with patch("storage._utc_datetime", return_value=later):
+            shown = await self.callback(f"view:{guest.id}", user_id=104)
+        photo = next(call for call in shown if isinstance(call, SendPhoto))
+        self.assertIn("Время посещений", photo.caption)
+        self.assertIn("Сейчас в гостях", photo.caption)
+        self.assertIn("Текущий визит: 25 ч. 01 мин. 01 сек.", photo.caption)
+        self.assertIn("Всего: 25 ч. 01 мин. 01 сек.", photo.caption)
+        self.assertIn("Завершённых визитов: 0", photo.caption)
+        self.assertLessEqual(len(photo.caption.encode("utf-16-le")) // 2, 1024)
+        comments = [call for call in shown if isinstance(call, SendMessage) and "😀" in call.text]
+        self.assertEqual(comment, "".join(call.text for call in comments).replace("Комментарий:\n", ""))
+        self.assertTrue(all(call.protect_content for call in [photo, *comments]))
+        self.assertEqual(f"stop:{guest.id}:{summary.active.id}", self.button([comments[-1]], "stop:"))
+        self.assertEqual(f"history:{guest.id}:0", self.button([comments[-1]], "history:"))
+
+    async def test_staff_can_open_visit_history_and_move_between_pages(self):
+        guest = self.seed()
+        actions = await self.callback(f"view:{guest.id}")
+        for _ in range(6):
+            started = await self.callback(self.button(actions, "start:"))
+            actions = await self.callback(self.button(started, "stop:"), user_id=102)
+        self.assertEqual(6, self.store.get_visit_summary(guest.id).completed_count)
+        history = await self.callback(self.button(actions, "history:"), user_id=104)
+        replies = [call for call in history if isinstance(call, SendMessage)]
+        self.assertTrue(any("История посещений: Иван Петров" in call.text for call in replies))
+        self.assertTrue(all(call.protect_content for call in replies))
+        forward = self.button(history, f"history:{guest.id}:5")
+        second = await self.callback(forward, user_id=103)
+        self.assertEqual(f"history:{guest.id}:0", self.button(second, "history:"))
+        self.assertTrue(any(isinstance(call, SendMessage) and "История посещений:" in call.text
+                            for call in second))
+        self.assertEqual(6, self.store.get_visit_summary(guest.id).completed_count)
 
 
 if __name__ == "__main__":

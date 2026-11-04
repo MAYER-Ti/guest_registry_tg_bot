@@ -17,12 +17,14 @@ from pathlib import Path
 import re
 import sqlite3
 import tempfile
-from typing import Iterator
+from typing import Iterable, Iterator
 import unicodedata
 from uuid import uuid4
 
 
 MAX_PHOTO_BYTES = 10 * 1024 * 1024
+MAX_ACCESS_ID = 2**53 - 1
+_LEGACY_ACCESS_PLACEHOLDER = 2**53
 _PHONE_FORMAT = re.compile(r"^[\d\s()+.\-]+$")
 _EDITABLE_FIELDS = {"name", "phone", "comment", "photo", "photo_file_id",
                     "entry_status", "entry_reason"}
@@ -97,6 +99,13 @@ class AuditEvent:
     created_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class EmployeeAccess:
+    user_id: int
+    added_by: int
+    added_at: str
+
+
 def normalize_name(value: str) -> str:
     """Normalize Unicode, case, Russian ё, and whitespace for name lookup."""
     if not isinstance(value, str):
@@ -123,6 +132,11 @@ def normalize_phone(value: str) -> str:
 
 def _validate_actor(actor_id: int) -> None:
     if isinstance(actor_id, bool) or not isinstance(actor_id, int) or actor_id <= 0:
+        raise ValueError("Некорректный Telegram ID сотрудника.")
+
+
+def _validate_access_id(value: int) -> None:
+    if type(value) is not int or not 1 <= value <= MAX_ACCESS_ID:
         raise ValueError("Некорректный Telegram ID сотрудника.")
 
 
@@ -263,13 +277,15 @@ class Store:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(guests)")}
             missing_entry_columns = {"entry_status", "entry_reason"} - columns
             missing_activity_tables = {"audit_events", "staff", "visit_reminders"} - tables
+            missing_access_tables = {"employee_access", "access_settings"} - tables
             if "guests" in tables and ("visits" not in tables or missing_entry_columns
-                                       or missing_activity_tables):
+                                       or missing_activity_tables or missing_access_tables):
                 # Back up old/partial schemas before any schema change. Run the
                 # online backup outside the transaction; failure aborts startup.
                 stamp = _utc_datetime().strftime("%Y%m%dT%H%M%S%fZ")
                 upgrade = ("visits" if "visits" not in tables else
-                           "entry-status" if missing_entry_columns else "activity")
+                           "entry-status" if missing_entry_columns else
+                           "activity" if missing_activity_tables else "access")
                 self.backup(self.path.parent / "backups" /
                             f"guests-before-{upgrade}-{stamp}-{uuid4().hex}.sqlite3")
             connection.execute("BEGIN IMMEDIATE")
@@ -356,6 +372,19 @@ class Store:
                     recipient_id INTEGER NOT NULL CHECK (recipient_id > 0),
                     sent_at TEXT NOT NULL,
                     PRIMARY KEY (visit_id, recipient_id)
+                )
+            """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS employee_access (
+                    user_id INTEGER PRIMARY KEY CHECK (user_id > 0 AND user_id <= 9007199254740991),
+                    added_by INTEGER NOT NULL CHECK (added_by > 0 AND added_by <= 9007199254740991),
+                    added_at TEXT NOT NULL
+                )
+            """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS access_settings (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    admin_id INTEGER NOT NULL CHECK (admin_id > 0 AND admin_id <= 9007199254740991)
                 )
             """)
             connection.commit()
@@ -660,6 +689,79 @@ class Store:
         if row is None:
             return f"Telegram ID {actor_id}"
         return f'{row["name"]} (@{row["username"]})' if row["username"] else row["name"]
+
+    def bootstrap_employee_access(self, initial_ids: Iterable[int], admin_id: int) -> None:
+        """Import the legacy allowlist once and pin its sole administrator.
+
+        The settings row and all imported grants commit together. Later calls
+        never re-grant access from environment variables. Remembered Telegram
+        profiles in ``staff`` are deliberately unrelated to authorization.
+        """
+        _validate_access_id(admin_id)
+        try:
+            supplied_ids = tuple(initial_ids)
+        except TypeError:
+            raise ValueError("Укажите список числовых Telegram ID сотрудников.") from None
+        seeds = set()
+        for user_id in supplied_ids:
+            if type(user_id) is int and user_id == _LEGACY_ACCESS_PLACEHOLDER:
+                continue  # Historical setup sentinel must never grant access.
+            _validate_access_id(user_id)
+            if user_id != admin_id:
+                seeds.add(user_id)
+        with self._connection() as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            settings = connection.execute("SELECT admin_id FROM access_settings WHERE singleton = 1").fetchone()
+            if settings is not None:
+                if settings["admin_id"] != admin_id:
+                    raise ValueError("Администратор базы уже установлен; автоматическая смена запрещена.")
+                return
+            connection.execute("INSERT INTO access_settings (singleton, admin_id) VALUES (1, ?)", (admin_id,))
+            now = _timestamp()
+            connection.executemany("""
+                INSERT OR IGNORE INTO employee_access (user_id, added_by, added_at)
+                VALUES (?, ?, ?)
+            """, [(user_id, admin_id, now) for user_id in sorted(seeds)])
+
+    def add_employee(self, user_id: int, actor_id: int) -> bool:
+        """Grant employee access once; only the pinned administrator may do so."""
+        _validate_access_id(user_id)
+        _validate_access_id(actor_id)
+        with self._connection() as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            settings = connection.execute("SELECT admin_id FROM access_settings WHERE singleton = 1").fetchone()
+            if settings is None or settings["admin_id"] != actor_id:
+                raise PermissionError("Добавлять сотрудников может только администратор.")
+            if user_id == actor_id:
+                return False  # The administrator's own access is implicit.
+            cursor = connection.execute("""
+                INSERT OR IGNORE INTO employee_access (user_id, added_by, added_at)
+                VALUES (?, ?, ?)
+            """, (user_id, actor_id, _timestamp()))
+            return cursor.rowcount == 1
+
+    def has_employee_access(self, user_id: int) -> bool:
+        _validate_access_id(user_id)
+        with self._connection() as connection:
+            return connection.execute("SELECT 1 FROM employee_access WHERE user_id = ?", (user_id,)).fetchone() is not None
+
+    def employee_ids(self) -> frozenset[int]:
+        """Return every employee ID without a page-size authorization limit."""
+        with self._connection() as connection:
+            return frozenset(row[0] for row in connection.execute("SELECT user_id FROM employee_access"))
+
+    def list_employees(self, limit: int = 8, offset: int = 0) -> list[EmployeeAccess]:
+        _validate_page(limit, offset)
+        with self._connection() as connection:
+            rows = connection.execute("""
+                SELECT user_id, added_by, added_at FROM employee_access
+                ORDER BY added_at, user_id LIMIT ? OFFSET ?
+            """, (limit, offset)).fetchall()
+        return [EmployeeAccess(**dict(row)) for row in rows]
+
+    def count_employees(self) -> int:
+        with self._connection() as connection:
+            return int(connection.execute("SELECT COUNT(*) FROM employee_access").fetchone()[0])
 
     def overdue_visits(self, *, now: datetime | None = None,
                        threshold_seconds: int = 86400) -> list[tuple[Guest, Visit]]:

@@ -5,8 +5,9 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import shutil
+import threading
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
 from aiogram.exceptions import (
@@ -16,6 +17,8 @@ from aiogram.exceptions import (
 from aiogram.methods import SendMessage
 
 import reminders
+from access import AccessPolicy
+from config import Config
 from storage import Guest, Store, Visit, VisitSummary
 
 
@@ -258,8 +261,106 @@ class ReminderDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.calls[0][1], NOW)
         self.assertEqual(self.store.calls[0][1].tzinfo, UTC)
 
+    async def test_live_provider_empty_then_new_employee_is_used_without_restart(self):
+        allowed = set()
+        main_thread = threading.get_ident()
+        provider_threads = []
+
+        def provider():
+            provider_threads.append(threading.get_ident())
+            return frozenset(allowed)
+
+        self.assertEqual(await self.send(allowed=provider), 0)
+        self.assertFalse(self.store.calls)
+        allowed.add(101)
+        self.assertEqual(await self.send(allowed=provider), 1)
+        self.assertEqual(self.bot.send_message.await_args.kwargs["chat_id"], 101)
+        self.assertTrue(provider_threads)
+        self.assertTrue(all(value != main_thread for value in provider_threads))
+
+    async def test_live_new_employee_starter_is_preferred_to_existing_admin(self):
+        self.store = FakeStore([(guest(), visit(started_by=103))])
+        allowed = {101}
+        provider = lambda: frozenset(allowed)
+        allowed.add(103)
+        self.assertEqual(await self.send(allowed=provider), 1)
+        self.assertEqual(self.bot.send_message.await_args.kwargs["chat_id"], 103)
+
+    async def test_live_recipient_is_rechecked_after_visit_query(self):
+        allowed = {101, 102}
+
+        def revoke_starter(store):
+            allowed.discard(101)
+
+        self.store.before_summary = revoke_starter
+        self.assertEqual(await self.send(allowed=lambda: allowed), 1)
+        self.assertEqual(self.bot.send_message.await_args.kwargs["chat_id"], 102)
+        self.assertEqual(self.store.delivered, {(1, 102)})
+
+    async def test_live_access_removed_during_pacing_does_not_send_second_message(self):
+        allowed = {101}
+        self.store = FakeStore([(guest(), visit()), (guest(2), visit(id=2, guest_id=2))])
+
+        async def revoke_access(_delay):
+            allowed.clear()
+
+        self.sleep.side_effect = revoke_access
+        self.assertEqual(await self.send(allowed=lambda: allowed), 1)
+        self.bot.send_message.assert_awaited_once()
+        self.assertEqual(self.store.delivered, {(1, 101)})
+
+    async def test_live_provider_failure_fails_closed_without_database_read_or_send(self):
+        provider = Mock(side_effect=RuntimeError("private permission path"))
+        with self.assertRaises(RuntimeError):
+            await self.send(allowed=provider)
+        self.assertFalse(self.store.calls)
+        self.bot.send_message.assert_not_awaited()
+
 
 class ReminderLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_loop_reloads_policy_after_employee_is_added_between_ticks(self):
+        allowed = set()
+        provider = Mock(side_effect=lambda: frozenset(allowed))
+        bot = AsyncMock()
+        store = FakeStore()
+        sleeps = []
+
+        async def next_tick(delay):
+            sleeps.append(delay)
+            if len(sleeps) == 1:
+                allowed.add(101)
+            else:
+                raise asyncio.CancelledError()
+
+        with patch.object(reminders, "_utc_now", return_value=NOW), \
+                patch.object(reminders.asyncio, "sleep", side_effect=next_tick):
+            with self.assertRaises(asyncio.CancelledError):
+                await reminders.reminder_loop(bot, store, provider)
+        self.assertEqual(sleeps, [300, 300])
+        bot.send_message.assert_awaited_once()
+        self.assertEqual(bot.send_message.await_args.kwargs["chat_id"], 101)
+        self.assertGreaterEqual(provider.call_count, 4)
+
+    async def test_loop_policy_read_failure_is_sanitized_and_retried(self):
+        provider = Mock(side_effect=[RuntimeError("private permission path"), ()])
+        bot = AsyncMock()
+        store = FakeStore()
+        sleeps = []
+
+        async def next_tick(delay):
+            sleeps.append(delay)
+            if len(sleeps) > 1:
+                raise asyncio.CancelledError()
+
+        with patch.object(reminders.asyncio, "sleep", side_effect=next_tick):
+            with self.assertLogs("reminders", level="ERROR") as logs:
+                with self.assertRaises(asyncio.CancelledError):
+                    await reminders.reminder_loop(bot, store, provider)
+        self.assertEqual(provider.call_count, 2)
+        self.assertNotIn("private permission path", " ".join(logs.output))
+        bot.send_message.assert_not_awaited()
+        self.assertFalse(store.calls)
+
     async def test_checks_immediately_and_retries_after_sanitized_failure(self):
         allowed = (value for value in (102, 101))
         send = AsyncMock(side_effect=[RuntimeError("private token=secret"), asyncio.CancelledError()])
@@ -369,6 +470,17 @@ class ReminderDurabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(Store(self.store.path).reminder_sent(self.active.id, 101))
         self.bot.send_message.side_effect = None
         self.assertEqual(await reminders.send_overdue_reminders(self.bot, self.store, (101,), now=NOW), 1)
+
+    async def test_added_employee_receives_reminder_from_live_sqlite_policy_without_restart(self):
+        admin = 7011639945
+        policy = AccessPolicy(Config(token="test", allowed_user_ids=frozenset({admin}),
+                                     db_path=self.store.path), self.store)
+        provider = policy.allowed_ids
+        self.assertNotIn(101, provider())
+        self.assertTrue(policy.add_employee(admin, 101))
+        self.assertEqual(await reminders.send_overdue_reminders(self.bot, self.store, provider, now=NOW), 1)
+        self.assertEqual(self.bot.send_message.await_args.kwargs["chat_id"], 101)
+        self.assertTrue(Store(self.store.path).reminder_sent(self.active.id, 101))
 
 
 if __name__ == "__main__":

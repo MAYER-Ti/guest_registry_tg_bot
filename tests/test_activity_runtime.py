@@ -31,9 +31,10 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                         events.append("webhook_deleted")
 
                 bot = FakeBot()
+                access_policy = Mock()
 
                 async def reminder_worker(*args):
-                    self.assertEqual(args, (bot, store, config.allowed_user_ids))
+                    self.assertEqual(args, (bot, store, access_policy.allowed_ids))
                     events.append("worker_started")
                     started.set()
                     try:
@@ -47,6 +48,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                         raise RuntimeError("Simulated polling failure")
 
                 dispatcher = Mock()
+                dispatcher.__getitem__ = Mock(return_value=access_policy)
                 dispatcher.resolve_used_update_types.return_value = ["message", "callback_query"]
                 dispatcher.start_polling = AsyncMock(side_effect=polling)
                 with patch.object(main, "load_config", return_value=config), \

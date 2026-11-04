@@ -19,6 +19,7 @@ class Config:
     allowed_user_ids: frozenset[int]
     db_path: Path
     extra_db_paths: tuple[Path, ...] = field(default=(), repr=False)
+    admin_user_id: int = 7011639945
 
 
 def get_db_path() -> Path:

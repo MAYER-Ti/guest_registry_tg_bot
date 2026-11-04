@@ -17,6 +17,16 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.db_path, Path("data/guests.sqlite3"))
         self.assertEqual(config.token, TOKEN)
         self.assertNotIn(TOKEN, repr(config))
+        self.assertEqual(config.admin_user_id, 7011639945)
+
+    def test_admin_is_fixed_independently_of_allowlist_and_environment(self):
+        environment = {"BOT_TOKEN": TOKEN, "ALLOWED_USER_IDS": "10,20",
+                       "ADMIN_USER_ID": "20"}
+        with patch.dict(os.environ, environment, clear=True):
+            config = load_config()
+        self.assertEqual(config.admin_user_id, 7011639945)
+        self.assertEqual(Config(TOKEN, frozenset({10}), Path("primary.sqlite3")).admin_user_id,
+                         7011639945)
 
     def test_missing_or_malformed_allowlist_always_fails_closed(self):
         for value in (None, "", " ", "10,", ",10", "10,,20", "0", "-10", "+10", "01", "name", "1.0", "١"):

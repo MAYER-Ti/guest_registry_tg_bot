@@ -12,7 +12,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 import logging
 import math
-from typing import Iterable
+from typing import Callable, Iterable
 
 from aiogram import Bot
 from aiogram.exceptions import (
@@ -28,6 +28,7 @@ REMINDER_AFTER_SECONDS = 24 * 60 * 60
 MESSAGE_INTERVAL_SECONDS = 1.05
 MOSCOW = timezone(timedelta(hours=3))
 logger = logging.getLogger(__name__)
+AllowedUsers = Iterable[int] | Callable[[], Iterable[int]]
 
 
 class ReminderRateLimit(RuntimeError):
@@ -55,6 +56,13 @@ def _recipients(allowed_user_ids: Iterable[int]) -> tuple[int, ...]:
                          if type(value) is int and value > 0}))
 
 
+async def _current_recipients(allowed_user_ids: AllowedUsers) -> tuple[int, ...]:
+    # The policy provider reads SQLite. Keep it off the polling event loop and
+    # never retain its result across checks or deliveries.
+    values = await asyncio.to_thread(allowed_user_ids) if callable(allowed_user_ids) else allowed_user_ids
+    return _recipients(values)
+
+
 def _reminder_text(guest: Guest, visit: Visit, now: datetime) -> str:
     hours, remainder = divmod(visit.duration_seconds(now), 3600)
     minutes, seconds = divmod(remainder, 60)
@@ -71,7 +79,7 @@ def _reminder_text(guest: Guest, visit: Visit, now: datetime) -> str:
 
 
 async def send_overdue_reminders(
-    bot: Bot, store: Store, allowed_user_ids: Iterable[int], *,
+    bot: Bot, store: Store, allowed_user_ids: AllowedUsers, *,
     now: datetime | None = None,
 ) -> int:
     """Send each due visit's reminder once per recipient; return sends accepted.
@@ -81,7 +89,8 @@ async def send_overdue_reminders(
     Telegram 429 aborts the batch with ``ReminderRateLimit``; accepted earlier
     messages remain durably marked, and every unsent item stays eligible.
     """
-    recipients = _recipients(allowed_user_ids)
+    source = allowed_user_ids if callable(allowed_user_ids) else _recipients(allowed_user_ids)
+    recipients = await _current_recipients(source)
     if not recipients:
         return 0
     current = _utc_now(now)
@@ -93,8 +102,11 @@ async def send_overdue_reminders(
     last_attempt: float | None = None
     loop = asyncio.get_running_loop()
     for guest, visit in visits:
-        recipient = visit.started_by if visit.started_by in recipients else recipients[0]
         try:
+            recipients = await _current_recipients(source)
+            if not recipients:
+                continue
+            recipient = visit.started_by if visit.started_by in recipients else recipients[0]
             if await asyncio.to_thread(store.reminder_sent, visit.id, recipient):
                 continue
             if last_attempt is not None:
@@ -105,6 +117,14 @@ async def send_overdue_reminders(
             summary = await asyncio.to_thread(store.get_visit_summary, guest.id, now=current)
             if (summary.active is None or summary.active.id != visit.id
                     or summary.active.duration_seconds(current) < REMINDER_AFTER_SECONDS):
+                continue
+            # Access can change during pacing or the visit read. Select the
+            # recipient again immediately before sending private guest data.
+            recipients = await _current_recipients(source)
+            if not recipients:
+                continue
+            recipient = visit.started_by if visit.started_by in recipients else recipients[0]
+            if await asyncio.to_thread(store.reminder_sent, visit.id, recipient):
                 continue
             last_attempt = loop.time()
             await bot.send_message(
@@ -131,7 +151,7 @@ async def send_overdue_reminders(
 
 
 async def reminder_loop(
-    bot: Bot, store: Store, allowed_user_ids: Iterable[int], *,
+    bot: Bot, store: Store, allowed_user_ids: AllowedUsers, *,
     interval_seconds: float = 300,
 ) -> None:
     """Check immediately on startup and then periodically; cancellation escapes."""
@@ -139,7 +159,10 @@ async def reminder_loop(
             or not isinstance(interval_seconds, (int, float))
             or not math.isfinite(interval_seconds) or interval_seconds <= 0):
         raise ValueError("Интервал проверки должен быть положительным числом.")
-    recipients = _recipients(allowed_user_ids)
+    # Freeze one-shot legacy iterables, but keep a live policy callable intact.
+    # send_overdue_reminders resolves that provider anew on every tick and
+    # rechecks it before each delivery.
+    recipients = allowed_user_ids if callable(allowed_user_ids) else _recipients(allowed_user_ids)
     while True:
         delay = interval_seconds
         try:

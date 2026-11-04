@@ -20,6 +20,7 @@ from aiogram.types import (
 )
 
 from config import Config, load_config
+from access import AccessPolicy, parse_employee_id
 from activity import active_guests, calculate_stats
 from excel_export import build_guest_workbook, prepare_photo_thumbnail
 from reporting import ReportError, report_snapshot
@@ -37,6 +38,8 @@ EXPORT = "📊 Выгрузить в Excel"
 STATS = "📈 Статистика"
 PRESENT = "🟢 Сейчас в заведении"
 AUDIT = "📜 История изменений"
+EMPLOYEES = "👥 Сотрудники"
+ADD_EMPLOYEE = "➕ Добавить сотрудника"
 CANCEL = "Отмена"
 ENTRY_OPEN = "🟢 Вход открыт"
 ENTRY_CLOSED = "🔴 Вход закрыт"
@@ -54,6 +57,9 @@ MENU = ReplyKeyboardMarkup(
               [KeyboardButton(text=PRESENT), KeyboardButton(text=STATS)],
               [KeyboardButton(text=AUDIT), KeyboardButton(text=EXPORT)]],
     resize_keyboard=True,
+)
+ADMIN_MENU = ReplyKeyboardMarkup(
+    keyboard=[*MENU.keyboard, [KeyboardButton(text=EMPLOYEES)]], resize_keyboard=True,
 )
 CANCEL_MENU = ReplyKeyboardMarkup(
     keyboard=[[KeyboardButton(text=CANCEL)]], resize_keyboard=True,
@@ -92,6 +98,11 @@ class EditGuest(StatesGroup):
 
 
 class DeleteGuest(StatesGroup):
+    confirm = State()
+
+
+class AddEmployee(StatesGroup):
+    user_id = State()
     confirm = State()
 
 
@@ -237,8 +248,8 @@ def audit_text(event, actor_label: str, *, compact: bool = True) -> str:
 
 
 class StaffOnly(BaseMiddleware):
-    def __init__(self, allowed: frozenset[int], store: Store):
-        self.allowed = allowed
+    def __init__(self, access: AccessPolicy, store: Store):
+        self.access = access
         self.store = store
 
     async def __call__(self, handler, event, data):
@@ -250,7 +261,7 @@ class StaffOnly(BaseMiddleware):
             if command == "/myid":
                 await event.answer(f"Твой Telegram ID: {user.id}", protect_content=True)
                 return
-        if not private or not user or user.id not in self.allowed:
+        if not private or not user or not await asyncio.to_thread(self.access.allows, user.id):
             if isinstance(event, CallbackQuery):
                 await event.answer("Нет доступа.", show_alert=True)
             elif private:
@@ -334,10 +345,15 @@ async def show_guest(message: Message, guest: Guest, store: Store) -> None:
 def build_dispatcher(config: Config, store: Store) -> Dispatcher:
     dispatcher = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
     router = Router()
-    guard = StaffOnly(config.allowed_user_ids, store)
+    access = AccessPolicy(config, store)
+    dispatcher["access_policy"] = access
+    guard = StaffOnly(access, store)
     router.message.outer_middleware(guard)
     router.callback_query.outer_middleware(guard)
     export_lock = asyncio.Lock()
+
+    def menu_for(message: Message):
+        return ADMIN_MENU if access.is_admin(message.chat.id) else MENU
 
     @router.message(CommandStart())
     @router.message(Command("help"))
@@ -350,21 +366,21 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
             "В меню доступны количество гостей, чёрный список и полная выгрузка в Excel.\n"
             "Также доступны статистика, история изменений и список гостей в заведении.\n"
             "Если таймер работает 24 часа, я напомню сотруднику, который его запустил.\n"
-            "Прервать действие: /cancel.", reply_markup=MENU,
+            "Прервать действие: /cancel.", reply_markup=menu_for(message),
         )
 
     @router.message(Command("cancel"))
     @router.message(F.text == CANCEL)
     async def cancel(message: Message, state: FSMContext):
         await state.clear()
-        await message.answer("Действие отменено.", reply_markup=MENU)
+        await message.answer("Действие отменено.", reply_markup=menu_for(message))
 
     async def report_failed(message: Message, error: ReportError):
         logging.getLogger(__name__).warning("Guest report failed (%s)", type(error).__name__)
         await message.answer(
             "Не удалось получить полный отчёт: одна из подключённых баз недоступна "
             "или содержит данные другого формата. Проверь подключение баз и попробуй ещё раз.",
-            reply_markup=MENU, protect_content=True,
+            reply_markup=menu_for(message), protect_content=True,
         )
 
     @router.message(Command("count"))
@@ -377,7 +393,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
             await report_failed(message, error)
             return
         await message.answer(
-            f"Всего гостей: {report.total_count}", reply_markup=MENU, protect_content=True,
+            f"Всего гостей: {report.total_count}", reply_markup=menu_for(message), protect_content=True,
         )
 
     @router.message(Command("blacklist"))
@@ -392,7 +408,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         closed = report.blacklist
         if not closed:
             await message.answer("Чёрный список пуст. Гостей со статусом «Вход закрыт» нет.",
-                                 reply_markup=MENU, protect_content=True)
+                                 reply_markup=menu_for(message), protect_content=True)
             return
         lines = [f"⛔ Чёрный список — гостей: {len(closed)}"]
         for index, row in enumerate(closed, 1):
@@ -407,7 +423,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
             while True:
                 try:
                     await message.answer(
-                        chunk, reply_markup=MENU if index == len(chunks) - 1 else None,
+                        chunk, reply_markup=menu_for(message) if index == len(chunks) - 1 else None,
                         protect_content=True,
                     )
                     break
@@ -429,13 +445,13 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
             return
         except (OSError, ValueError, RuntimeError) as error:
             logging.getLogger(__name__).warning("Excel creation failed (%s)", type(error).__name__)
-            await message.answer("Не удалось подготовить Excel. Попробуй ещё раз.", reply_markup=MENU)
+            await message.answer("Не удалось подготовить Excel. Попробуй ещё раз.", reply_markup=menu_for(message))
             return
         if len(content) > MAX_EXPORT_BYTES:
             await message.answer(
                 "Полная выгрузка превышает размер файла, который можно отправить через Telegram. "
                 "Карточки не обрезаны. Обратись к владельцу, чтобы получить полный файл другим способом.",
-                reply_markup=MENU, protect_content=True,
+                reply_markup=menu_for(message), protect_content=True,
             )
             return
         exported_at = report.generated_at.astimezone(MOSCOW)
@@ -445,17 +461,17 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
                 document=BufferedInputFile(content, filename=filename),
                 caption=(f"Карточек: {report.total_count}. Баз: {len(report.sources)}.\n"
                          f"Выгрузка на {exported_at:%d.%m.%Y %H:%M:%S} МСК."),
-                reply_markup=MENU, protect_content=True,
+                reply_markup=menu_for(message), protect_content=True,
             )
         except (TelegramBadRequest, TelegramNetworkError):
             await message.answer("Не удалось отправить файл. Нажми «Выгрузить в Excel» ещё раз.",
-                                 reply_markup=MENU)
+                                 reply_markup=menu_for(message))
 
     @router.message(Command("export"))
     @router.message(F.text.in_({EXPORT, "Выгрузить в Excel"}))
     async def export_guests(message: Message, state: FSMContext):
         await state.clear()
-        await message.answer("Готовлю Excel со всеми карточками гостей…", reply_markup=MENU,
+        await message.answer("Готовлю Excel со всеми карточками гостей…", reply_markup=menu_for(message),
                              protect_content=True)
         # Keep only one workbook in flight, including the Telegram upload.
         async with export_lock:
@@ -492,7 +508,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
     @router.message(F.text.in_({STATS, "Статистика"}))
     async def statistics(message: Message, state: FSMContext):
         await state.clear()
-        await message.answer("Выбери период статистики.", reply_markup=MENU)
+        await message.answer("Выбери период статистики.", reply_markup=menu_for(message))
         await statistics_page(message, "day")
 
     @router.callback_query(F.data.startswith("stats:"))
@@ -540,7 +556,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
     @router.message(F.text.in_({PRESENT, "Сейчас в заведении"}))
     async def present(message: Message, state: FSMContext):
         await state.clear()
-        await message.answer("Гости с активным таймером:", reply_markup=MENU)
+        await message.answer("Гости с активным таймером:", reply_markup=menu_for(message))
         await present_page(message)
 
     @router.callback_query(F.data.startswith("present:"))
@@ -583,7 +599,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
     @router.message(F.text.in_({AUDIT, "История изменений"}))
     async def audit_history(message: Message, state: FSMContext):
         await state.clear()
-        await message.answer("Журнал действий сотрудников:", reply_markup=MENU)
+        await message.answer("Журнал действий сотрудников:", reply_markup=menu_for(message))
         await audit_page(message)
 
     @router.callback_query(F.data.startswith("audit:"))
@@ -613,6 +629,135 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         await answer_parts(query.message, audit_text(event, label, compact=False), reply_markup=keyboard([
             [("История карточки", f"audit:{event.guest_id}:0"), ("Вся история", "audit:all:0")],
         ]))
+
+    async def admin_only(event) -> bool:
+        if access.is_admin(event.from_user.id):
+            return True
+        if isinstance(event, CallbackQuery):
+            await event.answer("Управление сотрудниками доступно только администратору.", show_alert=True)
+        else:
+            await event.answer("Управление сотрудниками доступно только администратору.",
+                               reply_markup=menu_for(event))
+        return False
+
+    async def staff_page(message: Message, offset: int = 0):
+        total = await asyncio.to_thread(store.count_employees)
+        offset = min(offset, max(0, (total - 1) // PAGE_SIZE * PAGE_SIZE))
+        employees = await asyncio.to_thread(store.list_employees, PAGE_SIZE, offset)
+        lines = [EMPLOYEES, f"Администратор: {access.admin_user_id}",
+                 f"Сотрудников с доступом: {total}"]
+        for index, employee in enumerate(employees, offset + 1):
+            label = await asyncio.to_thread(store.staff_label, employee.user_id)
+            identity = label if label.startswith("Telegram ID ") else f"{label} · ID {employee.user_id}"
+            lines.append(f"\n{index}. {identity}\nДобавлен: {format_visit_time(employee.added_at)} МСК")
+        if not employees:
+            lines.append("\nПока доступ есть только у администратора.")
+        lines.append("\nНовый сотрудник отправляет боту /myid и передаёт тебе числовой ID. "
+                     "Добавлять сотрудников может только администратор.")
+        rows = [[(ADD_EMPLOYEE, "staff:add")]]
+        navigation = []
+        if offset:
+            navigation.append(("← Назад", f"staff:list:{max(0, offset - PAGE_SIZE)}"))
+        if offset + PAGE_SIZE < total:
+            navigation.append(("Далее →", f"staff:list:{offset + PAGE_SIZE}"))
+        if navigation:
+            rows.append(navigation)
+        rows.append([("🔄 Обновить список", f"staff:list:{offset}")])
+        await answer_parts(message, "\n".join(lines), reply_markup=keyboard(rows))
+
+    @router.message(Command("staff"))
+    @router.message(F.text == EMPLOYEES)
+    async def staff_panel(message: Message, state: FSMContext):
+        if not await admin_only(message):
+            return
+        await state.clear()
+        await message.answer("Управление доступом сотрудников.", reply_markup=menu_for(message))
+        await staff_page(message)
+
+    @router.callback_query(F.data.startswith("staff:list:"))
+    async def staff_navigation(query: CallbackQuery, state: FSMContext):
+        if not await admin_only(query):
+            return
+        parts = query.data.split(":")
+        if len(parts) != 3 or not callback_number(parts[2]):
+            await query.answer("Некорректная страница.", show_alert=True)
+            return
+        await query.answer()
+        await state.clear()
+        await staff_page(query.message, int(parts[2]))
+
+    async def begin_staff_add(message: Message, state: FSMContext):
+        await state.clear()
+        await state.set_state(AddEmployee.user_id)
+        await message.answer(
+            "Пришли числовой Telegram ID сотрудника.\n"
+            "Пусть он отправит этому боту /myid и передаст тебе полученное число.\n"
+            "Нужен именно ID, а не @username или номер телефона.",
+            reply_markup=CANCEL_MENU,
+        )
+
+    @router.message(Command("addstaff"))
+    @router.message(F.text == ADD_EMPLOYEE)
+    async def staff_add_command(message: Message, state: FSMContext):
+        if not await admin_only(message):
+            return
+        await begin_staff_add(message, state)
+
+    @router.callback_query(F.data == "staff:add")
+    async def staff_add_button(query: CallbackQuery, state: FSMContext):
+        if not await admin_only(query):
+            return
+        await query.answer()
+        await begin_staff_add(query.message, state)
+
+    @router.message(AddEmployee.user_id)
+    async def employee_id(message: Message, state: FSMContext):
+        if not await admin_only(message):
+            return
+        try:
+            target_id = parse_employee_id(message.text or "")
+            if access.is_admin(target_id):
+                raise ValueError("Этот ID уже является администратором.")
+        except ValueError as error:
+            await message.answer(str(error), reply_markup=CANCEL_MENU)
+            return
+        if await asyncio.to_thread(store.has_employee_access, target_id):
+            await state.clear()
+            await message.answer(f"У сотрудника {target_id} уже есть доступ.", reply_markup=menu_for(message))
+            return
+        nonce = secrets.token_hex(8)
+        await state.set_state(AddEmployee.confirm)
+        await state.update_data(employee_id=target_id, employee_nonce=nonce)
+        await message.answer(
+            f"Добавить сотрудника с Telegram ID {target_id}?\n\n"
+            "Он получит доступ к общей базе: сможет добавлять, искать, изменять и удалять карточки, "
+            "отмечать посещения и получать отчёты. Добавлять других сотрудников он не сможет.",
+            reply_markup=keyboard([[("✅ Добавить", f"staffconfirm:{target_id}:{nonce}"), (CANCEL, "cancel")]]),
+            protect_content=True,
+        )
+
+    @router.callback_query(F.data.startswith("staffconfirm:"))
+    async def confirm_employee(query: CallbackQuery, state: FSMContext):
+        if not await admin_only(query):
+            return
+        data = await state.get_data()
+        expected = f"staffconfirm:{data.get('employee_id')}:{data.get('employee_nonce')}"
+        if await state.get_state() != AddEmployee.confirm.state or query.data != expected:
+            await query.answer("Подтверждение уже закрыто. Начни добавление заново.", show_alert=True)
+            return
+        try:
+            added = await asyncio.to_thread(access.add_employee, query.from_user.id, data["employee_id"])
+        except (PermissionError, ValueError) as error:
+            await query.answer(str(error), show_alert=True)
+            await state.clear()
+            return
+        await query.answer("Доступ открыт." if added else "У сотрудника уже есть доступ.")
+        await state.clear()
+        await query.message.answer(
+            f"Сотрудник {data['employee_id']} добавлен. Пусть отправит боту /start."
+            if added else f"У сотрудника {data['employee_id']} уже есть доступ.",
+            reply_markup=menu_for(query.message), protect_content=True,
+        )
 
     @router.message(F.text == ADD)
     async def add_start(message: Message, state: FSMContext):
@@ -724,7 +869,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
     async def cancel_button(query: CallbackQuery, state: FSMContext):
         await query.answer()
         await state.clear()
-        await query.message.answer("Действие отменено.", reply_markup=MENU)
+        await query.message.answer("Действие отменено.", reply_markup=menu_for(query.message))
 
     @router.callback_query(F.data.startswith("save:"))
     async def save(query: CallbackQuery, state: FSMContext):
@@ -741,10 +886,10 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
             )
         except DuplicatePhoneError:
             await state.clear()
-            await query.message.answer("Другой сотрудник уже добавил этот номер. Найди карточку через поиск.", reply_markup=MENU)
+            await query.message.answer("Другой сотрудник уже добавил этот номер. Найди карточку через поиск.", reply_markup=menu_for(query.message))
             return
         await state.clear()
-        await query.message.answer("Гость сохранён в общей базе.", reply_markup=MENU)
+        await query.message.answer("Гость сохранён в общей базе.", reply_markup=menu_for(query.message))
         await show_guest(query.message, guest, store)
 
     @router.message(AddGuest.confirm)
@@ -763,7 +908,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
             guest = await asyncio.to_thread(store.get_guest, found[0].id)
             if guest:
                 await state.clear()
-                await message.answer("Гость найден.", reply_markup=MENU)
+                await message.answer("Гость найден.", reply_markup=menu_for(message))
                 await show_guest(message, guest, store)
             else:
                 await message.answer("Карточка только что удалена. Попробуй новый поиск.")
@@ -813,10 +958,10 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         await query.answer()
         await state.clear()
         if guest:
-            await query.message.answer("Карточка гостя:", reply_markup=MENU)
+            await query.message.answer("Карточка гостя:", reply_markup=menu_for(query.message))
             await show_guest(query.message, guest, store)
         else:
-            await query.message.answer("Карточка уже удалена.", reply_markup=MENU)
+            await query.message.answer("Карточка уже удалена.", reply_markup=menu_for(query.message))
 
     @router.callback_query(F.data.startswith("start:"))
     async def start_timer(query: CallbackQuery, state: FSMContext):
@@ -833,10 +978,10 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         await state.clear()
         guest = await asyncio.to_thread(store.get_guest, int(parts[1]))
         if guest:
-            await query.message.answer("▶️ Посещение начато. Когда гость уйдёт, нажми «Стоп».", reply_markup=MENU)
+            await query.message.answer("▶️ Посещение начато. Когда гость уйдёт, нажми «Стоп».", reply_markup=menu_for(query.message))
             await show_guest(query.message, guest, store)
         else:
-            await query.message.answer("Карточка уже удалена.", reply_markup=MENU)
+            await query.message.answer("Карточка уже удалена.", reply_markup=menu_for(query.message))
 
     @router.callback_query(F.data.startswith("stop:"))
     async def stop_timer(query: CallbackQuery, state: FSMContext):
@@ -855,11 +1000,11 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         if guest:
             await query.message.answer(
                 "⏹ Посещение завершено: " + format_duration(visit.duration_seconds()) + ".\nВремя добавлено к общему.",
-                reply_markup=MENU,
+                reply_markup=menu_for(query.message),
             )
             await show_guest(query.message, guest, store)
         else:
-            await query.message.answer("Карточка уже удалена.", reply_markup=MENU)
+            await query.message.answer("Карточка уже удалена.", reply_markup=menu_for(query.message))
 
     @router.callback_query(F.data.startswith("history:"))
     async def visit_history(query: CallbackQuery, state: FSMContext):
@@ -955,13 +1100,13 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
             return
         except StaleGuestError:
             await state.clear()
-            await message.answer("Другой сотрудник изменил или удалил карточку. Найди её заново.", reply_markup=MENU)
+            await message.answer("Другой сотрудник изменил или удалил карточку. Найди её заново.", reply_markup=menu_for(message))
             return
         except ValueError as error:
             await message.answer(str(error))
             return
         await state.clear()
-        await message.answer("Карточка обновлена.", reply_markup=MENU)
+        await message.answer("Карточка обновлена.", reply_markup=menu_for(message))
         await show_guest(message, guest, store)
 
     @router.message(EditGuest.value)
@@ -1043,10 +1188,10 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         try:
             await asyncio.to_thread(store.delete_guest, guest.id, guest.version, query.from_user.id)
         except StaleGuestError:
-            await query.message.answer("Карточка изменилась. Найди её заново.", reply_markup=MENU)
+            await query.message.answer("Карточка изменилась. Найди её заново.", reply_markup=menu_for(query.message))
             return
         await state.clear()
-        await query.message.answer("Карточка удалена из общей базы.", reply_markup=MENU)
+        await query.message.answer("Карточка удалена из общей базы.", reply_markup=menu_for(query.message))
 
     @router.callback_query()
     async def unknown_button(query: CallbackQuery):
@@ -1054,7 +1199,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
 
     @router.message()
     async def unknown_message(message: Message):
-        await message.answer("Выбери действие в меню.", reply_markup=MENU)
+        await message.answer("Выбери действие в меню.", reply_markup=menu_for(message))
 
     dispatcher.include_router(router)
     return dispatcher
@@ -1068,7 +1213,7 @@ async def main() -> None:
         identity = await bot.get_me()
         logging.getLogger(__name__).info("Telegram connected: @%s (id=%s)", identity.username, identity.id)
         await bot.delete_webhook(drop_pending_updates=False)
-        reminders = asyncio.create_task(reminder_loop(bot, store, config.allowed_user_ids))
+        reminders = asyncio.create_task(reminder_loop(bot, store, dispatcher["access_policy"].allowed_ids))
         try:
             await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
         finally:

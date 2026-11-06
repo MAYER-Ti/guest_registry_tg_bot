@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
+import sqlite3
 from contextlib import suppress
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
@@ -22,9 +24,12 @@ from aiogram.types import (
 from config import Config, load_config
 from access import AccessPolicy, parse_employee_id
 from activity import active_guests, calculate_stats
+from cloud_backups import cloud_backup_loop
 from excel_export import build_guest_workbook, prepare_photo_thumbnail
 from reporting import ReportError, report_snapshot
 from reminders import reminder_loop
+from sheets_store import SheetsStorageError
+from storage_factory import open_store
 from storage import (
     DuplicatePhoneError, Guest, StaleGuestError, Store, VisitStateError,
     VisitSummary, normalize_phone,
@@ -247,12 +252,69 @@ def audit_text(event, actor_label: str, *, compact: bool = True) -> str:
     return "\n".join(lines)
 
 
+_ACKNOWLEDGED_CLOUD_QUERY = ContextVar("acknowledged_cloud_query", default=None)
+
+
+async def answer_callback(query: CallbackQuery, text: str | None = None, **kwargs):
+    """Cloud callbacks are acknowledged before network storage access.
+
+    Later status/error text goes to the private conversation instead of trying
+    to answer an expired Telegram callback after a committed cloud mutation.
+    Local SQLite callbacks retain their original Telegram answer behavior.
+    """
+    if _ACKNOWLEDGED_CLOUD_QUERY.get() == query.id:
+        if text and isinstance(query.message, Message) and query.message.chat.type == "private":
+            return await query.message.answer(text, protect_content=True)
+        return None
+    return await query.answer(text=text, **kwargs)
+
+
 class StaffOnly(BaseMiddleware):
     def __init__(self, access: AccessPolicy, store: Store):
         self.access = access
         self.store = store
 
     async def __call__(self, handler, event, data):
+        token = None
+        if (getattr(self.store, "backend", None) == "google_sheets"
+                and isinstance(event, CallbackQuery) and isinstance(event.message, Message)
+                and event.message.chat.type == "private"):
+            # This neutral ACK reveals no registry information and happens
+            # before allows/remember_staff, which can each be a slow RPC.
+            try:
+                await event.answer()
+            except TelegramBadRequest:
+                await event.message.answer(
+                    "Кнопка устарела. Открой меню или карточку заново.", protect_content=True,
+                )
+                return
+            token = _ACKNOWLEDGED_CLOUD_QUERY.set(event.id)
+        try:
+            try:
+                return await self._handle(handler, event, data)
+            except (SheetsStorageError, FileNotFoundError, sqlite3.DatabaseError):
+                logging.getLogger(__name__).warning("Storage request failed")
+                if isinstance(event, CallbackQuery):
+                    if _ACKNOWLEDGED_CLOUD_QUERY.get() != event.id:
+                        with suppress(TelegramBadRequest):
+                            await answer_callback(event, "База временно недоступна. Попробуй позже.", show_alert=True)
+                    if isinstance(event.message, Message) and event.message.chat.type == "private":
+                        await event.message.answer(
+                            "Не удалось подтвердить операцию. Попробуй позже; перед повторным "
+                            "действием проверь карточку через поиск.",
+                            protect_content=True,
+                        )
+                elif isinstance(event, Message) and event.chat.type == "private":
+                    await event.answer(
+                        "Не удалось подтвердить операцию. Попробуй позже; перед повторным "
+                        "действием проверь карточку через поиск.",
+                        protect_content=True,
+                    )
+        finally:
+            if token is not None:
+                _ACKNOWLEDGED_CLOUD_QUERY.reset(token)
+
+    async def _handle(self, handler, event, data):
         user = event.from_user
         message = event if isinstance(event, Message) else event.message
         private = isinstance(message, Message) and message.chat.type == "private"
@@ -263,7 +325,7 @@ class StaffOnly(BaseMiddleware):
                 return
         if not private or not user or not await asyncio.to_thread(self.access.allows, user.id):
             if isinstance(event, CallbackQuery):
-                await event.answer("Нет доступа.", show_alert=True)
+                await answer_callback(event, "Нет доступа.", show_alert=True)
             elif private:
                 await event.answer("Доступ только для сотрудников. Твой ID: " + str(user.id))
             return
@@ -515,9 +577,9 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
     async def statistics_period(query: CallbackQuery, state: FSMContext):
         period = query.data.split(":")
         if len(period) != 2 or period[1] not in {"day", "week", "month"}:
-            await query.answer("Некорректный период.", show_alert=True)
+            await answer_callback(query, "Некорректный период.", show_alert=True)
             return
-        await query.answer()
+        await answer_callback(query)
         await state.clear()
         await statistics_page(query.message, period[1])
 
@@ -563,9 +625,9 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
     async def present_navigation(query: CallbackQuery, state: FSMContext):
         parts = query.data.split(":")
         if len(parts) != 2 or not callback_number(parts[1]):
-            await query.answer("Некорректная страница.", show_alert=True)
+            await answer_callback(query, "Некорректная страница.", show_alert=True)
             return
-        await query.answer()
+        await answer_callback(query)
         await state.clear()
         await present_page(query.message, int(parts[1]))
 
@@ -607,9 +669,9 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         parts = query.data.split(":")
         if (len(parts) != 3 or not callback_number(parts[2]) or
                 not (parts[1] == "all" or callback_number(parts[1], positive=True))):
-            await query.answer("Некорректная страница.", show_alert=True)
+            await answer_callback(query, "Некорректная страница.", show_alert=True)
             return
-        await query.answer()
+        await answer_callback(query)
         await state.clear()
         await audit_page(query.message, None if parts[1] == "all" else int(parts[1]), int(parts[2]))
 
@@ -617,13 +679,13 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
     async def audit_detail(query: CallbackQuery, state: FSMContext):
         parts = query.data.split(":")
         if len(parts) != 2 or not callback_number(parts[1], positive=True):
-            await query.answer("Некорректная запись.", show_alert=True)
+            await answer_callback(query, "Некорректная запись.", show_alert=True)
             return
         event = await asyncio.to_thread(store.get_audit, int(parts[1]))
         if event is None:
-            await query.answer("Запись недоступна.", show_alert=True)
+            await answer_callback(query, "Запись недоступна.", show_alert=True)
             return
-        await query.answer()
+        await answer_callback(query)
         await state.clear()
         label = await asyncio.to_thread(store.staff_label, event.actor_id) if event.actor_id else "Не указан"
         await answer_parts(query.message, audit_text(event, label, compact=False), reply_markup=keyboard([
@@ -634,7 +696,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         if access.is_admin(event.from_user.id):
             return True
         if isinstance(event, CallbackQuery):
-            await event.answer("Управление сотрудниками доступно только администратору.", show_alert=True)
+            await answer_callback(event, "Управление сотрудниками доступно только администратору.", show_alert=True)
         else:
             await event.answer("Управление сотрудниками доступно только администратору.",
                                reply_markup=menu_for(event))
@@ -680,9 +742,9 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
             return
         parts = query.data.split(":")
         if len(parts) != 3 or not callback_number(parts[2]):
-            await query.answer("Некорректная страница.", show_alert=True)
+            await answer_callback(query, "Некорректная страница.", show_alert=True)
             return
-        await query.answer()
+        await answer_callback(query)
         await state.clear()
         await staff_page(query.message, int(parts[2]))
 
@@ -707,7 +769,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
     async def staff_add_button(query: CallbackQuery, state: FSMContext):
         if not await admin_only(query):
             return
-        await query.answer()
+        await answer_callback(query)
         await begin_staff_add(query.message, state)
 
     @router.message(AddEmployee.user_id)
@@ -743,15 +805,15 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         data = await state.get_data()
         expected = f"staffconfirm:{data.get('employee_id')}:{data.get('employee_nonce')}"
         if await state.get_state() != AddEmployee.confirm.state or query.data != expected:
-            await query.answer("Подтверждение уже закрыто. Начни добавление заново.", show_alert=True)
+            await answer_callback(query, "Подтверждение уже закрыто. Начни добавление заново.", show_alert=True)
             return
         try:
             added = await asyncio.to_thread(access.add_employee, query.from_user.id, data["employee_id"])
         except (PermissionError, ValueError) as error:
-            await query.answer(str(error), show_alert=True)
+            await answer_callback(query, str(error), show_alert=True)
             await state.clear()
             return
-        await query.answer("Доступ открыт." if added else "У сотрудника уже есть доступ.")
+        await answer_callback(query, "Доступ открыт." if added else "У сотрудника уже есть доступ.")
         await state.clear()
         await query.message.answer(
             f"Сотрудник {data['employee_id']} добавлен. Пусть отправит боту /start."
@@ -867,7 +929,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
 
     @router.callback_query(F.data == "cancel")
     async def cancel_button(query: CallbackQuery, state: FSMContext):
-        await query.answer()
+        await answer_callback(query)
         await state.clear()
         await query.message.answer("Действие отменено.", reply_markup=menu_for(query.message))
 
@@ -875,9 +937,9 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
     async def save(query: CallbackQuery, state: FSMContext):
         draft = await state.get_data()
         if await state.get_state() != AddGuest.confirm.state or query.data != f"save:{draft.get('nonce')}":
-            await query.answer("Этот черновик уже закрыт. Начни добавление заново.", show_alert=True)
+            await answer_callback(query, "Этот черновик уже закрыт. Начни добавление заново.", show_alert=True)
             return
-        await query.answer()
+        await answer_callback(query)
         try:
             guest = await asyncio.to_thread(
                 store.add_guest, name=draft["name"], phone=draft["phone"], comment=draft["comment"],
@@ -942,9 +1004,9 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         parts = query.data.split(":")
         data = await state.get_data()
         if len(parts) != 3 or parts[1] != data.get("search_nonce") or not parts[2].isdigit():
-            await query.answer("Этот поиск уже закрыт. Выполни новый поиск.", show_alert=True)
+            await answer_callback(query, "Этот поиск уже закрыт. Выполни новый поиск.", show_alert=True)
             return
-        await query.answer()
+        await answer_callback(query)
         await search_page(query.message, state, int(parts[2]))
 
     @router.callback_query(F.data.startswith("view:"))
@@ -952,10 +1014,10 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         try:
             guest_id = int(query.data.split(":")[1])
         except (ValueError, IndexError):
-            await query.answer("Карточка недоступна.", show_alert=True)
+            await answer_callback(query, "Карточка недоступна.", show_alert=True)
             return
         guest = await asyncio.to_thread(store.get_guest, guest_id)
-        await query.answer()
+        await answer_callback(query)
         await state.clear()
         if guest:
             await query.message.answer("Карточка гостя:", reply_markup=menu_for(query.message))
@@ -967,14 +1029,14 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
     async def start_timer(query: CallbackQuery, state: FSMContext):
         parts = query.data.split(":")
         if len(parts) != 3 or not all(part.isdigit() and int(part) > 0 for part in parts[1:]):
-            await query.answer("Некорректная кнопка.", show_alert=True)
+            await answer_callback(query, "Некорректная кнопка.", show_alert=True)
             return
         try:
             await asyncio.to_thread(store.start_visit, int(parts[1]), int(parts[2]), query.from_user.id)
         except (StaleGuestError, VisitStateError) as error:
-            await query.answer(str(error) + " Открой карточку заново.", show_alert=True)
+            await answer_callback(query, str(error) + " Открой карточку заново.", show_alert=True)
             return
-        await query.answer("Время пошло.")
+        await answer_callback(query, "Время пошло.")
         await state.clear()
         guest = await asyncio.to_thread(store.get_guest, int(parts[1]))
         if guest:
@@ -987,14 +1049,14 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
     async def stop_timer(query: CallbackQuery, state: FSMContext):
         parts = query.data.split(":")
         if len(parts) != 3 or not all(part.isdigit() and int(part) > 0 for part in parts[1:]):
-            await query.answer("Некорректная кнопка.", show_alert=True)
+            await answer_callback(query, "Некорректная кнопка.", show_alert=True)
             return
         try:
             visit = await asyncio.to_thread(store.stop_visit, int(parts[1]), int(parts[2]), query.from_user.id)
         except (StaleGuestError, VisitStateError, ValueError) as error:
-            await query.answer(str(error) + " Обнови карточку.", show_alert=True)
+            await answer_callback(query, str(error) + " Обнови карточку.", show_alert=True)
             return
-        await query.answer("Посещение сохранено.")
+        await answer_callback(query, "Посещение сохранено.")
         await state.clear()
         guest = await asyncio.to_thread(store.get_guest, int(parts[1]))
         if guest:
@@ -1010,15 +1072,15 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
     async def visit_history(query: CallbackQuery, state: FSMContext):
         parts = query.data.split(":")
         if len(parts) != 3 or not parts[1].isdigit() or int(parts[1]) <= 0 or not parts[2].isdigit():
-            await query.answer("Некорректная кнопка.", show_alert=True)
+            await answer_callback(query, "Некорректная кнопка.", show_alert=True)
             return
         guest_id, offset = int(parts[1]), int(parts[2])
         guest = await asyncio.to_thread(store.get_guest, guest_id)
         if not guest:
-            await query.answer("Карточка уже удалена.", show_alert=True)
+            await answer_callback(query, "Карточка уже удалена.", show_alert=True)
             return
         visits = await asyncio.to_thread(store.list_visits, guest_id, VISIT_PAGE_SIZE + 1, offset)
-        await query.answer()
+        await answer_callback(query)
         await state.clear()
         lines = [f"История посещений: {guest.name}", "Время указано по Москве (МСК)."]
         now = datetime.now(timezone.utc)
@@ -1044,11 +1106,11 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         try:
             guest_id, version = int(parts[-2]), int(parts[-1])
         except (ValueError, IndexError):
-            await query.answer("Некорректная кнопка.", show_alert=True)
+            await answer_callback(query, "Некорректная кнопка.", show_alert=True)
             return None
         guest = await asyncio.to_thread(store.get_guest, guest_id)
         if not guest or guest.version != version:
-            await query.answer("Карточка изменена или удалена. Открой её заново через поиск.", show_alert=True)
+            await answer_callback(query, "Карточка изменена или удалена. Открой её заново через поиск.", show_alert=True)
             return None
         return guest
 
@@ -1057,7 +1119,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         guest = await current_guest(query, query.data.split(":"))
         if guest is None:
             return
-        await query.answer()
+        await answer_callback(query)
         await state.clear()
         key = f"{guest.id}:{guest.version}"
         await query.message.answer("Что изменить?", reply_markup=keyboard([
@@ -1071,12 +1133,12 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
     async def field(query: CallbackQuery, state: FSMContext):
         parts = query.data.split(":")
         if len(parts) != 4 or parts[1] not in {"photo", "phone", "name", "comment", "entry_status", "entry_reason"}:
-            await query.answer("Некорректная кнопка.", show_alert=True)
+            await answer_callback(query, "Некорректная кнопка.", show_alert=True)
             return
         guest = await current_guest(query, parts)
         if guest is None:
             return
-        await query.answer()
+        await answer_callback(query)
         await state.clear()
         await state.set_state(EditGuest.value)
         await state.update_data(guest_id=guest.id, version=guest.version, field=parts[1])
@@ -1162,7 +1224,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         guest = await current_guest(query, query.data.split(":"))
         if guest is None:
             return
-        await query.answer()
+        await answer_callback(query)
         await state.clear()
         nonce = secrets.token_hex(4)
         await state.set_state(DeleteGuest.confirm)
@@ -1179,12 +1241,12 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         data = await state.get_data()
         expected = f"remove:{data.get('delete_id')}:{data.get('delete_version')}:{data.get('delete_nonce')}"
         if await state.get_state() != DeleteGuest.confirm.state or query.data != expected:
-            await query.answer("Подтверждение уже закрыто. Открой карточку заново.", show_alert=True)
+            await answer_callback(query, "Подтверждение уже закрыто. Открой карточку заново.", show_alert=True)
             return
         guest = await current_guest(query, query.data.split(":")[1:3])
         if guest is None:
             return
-        await query.answer()
+        await answer_callback(query)
         try:
             await asyncio.to_thread(store.delete_guest, guest.id, guest.version, query.from_user.id)
         except StaleGuestError:
@@ -1195,7 +1257,7 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
 
     @router.callback_query()
     async def unknown_button(query: CallbackQuery):
-        await query.answer("Эта кнопка устарела. Открой меню командой /start.", show_alert=True)
+        await answer_callback(query, "Эта кнопка устарела. Открой меню командой /start.", show_alert=True)
 
     @router.message()
     async def unknown_message(message: Message):
@@ -1207,19 +1269,22 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
 
 async def main() -> None:
     config = load_config()
-    store = Store(config.db_path)
+    store = open_store(config)
     dispatcher = build_dispatcher(config, store)
     async with Bot(config.token) as bot:
         identity = await bot.get_me()
         logging.getLogger(__name__).info("Telegram connected: @%s (id=%s)", identity.username, identity.id)
         await bot.delete_webhook(drop_pending_updates=False)
         reminders = asyncio.create_task(reminder_loop(bot, store, dispatcher["access_policy"].allowed_ids))
+        backup_worker = (asyncio.create_task(cloud_backup_loop(bot, store, config.admin_user_id))
+                         if getattr(config, "storage_backend", "sqlite") == "google_sheets" else None)
         try:
             await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
         finally:
-            reminders.cancel()
-            with suppress(asyncio.CancelledError):
-                await reminders
+            workers = [reminders] + ([backup_worker] if backup_worker is not None else [])
+            for worker in workers:
+                worker.cancel()
+            await asyncio.gather(*workers, return_exceptions=True)
 
 
 if __name__ == "__main__":

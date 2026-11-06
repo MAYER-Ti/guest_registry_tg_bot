@@ -219,9 +219,54 @@ def report_snapshot(primary: Store | Path | str, extras: Iterable[Path | str] = 
     retain only small thumbnails rather than every full-sized original.
     """
     instant = _utc_now(now)
+    if getattr(primary, "backend", None) == "google_sheets":
+        return _cloud_snapshot(primary, extras, include_photos, instant, photo_transform)
     paths = _unique_paths(primary, extras)
     rows: list[ReportGuest] = []
     for index, path in enumerate(paths, start=1):
         rows.extend(_read_source(path, index, include_photos, instant, photo_transform))
     return ReportSnapshot(instant, tuple(_source_name(index) for index in range(1, len(paths) + 1)),
                           tuple(rows))
+
+
+def _cloud_snapshot(primary, extras, include_photos, instant, photo_transform):
+    """Use a single cloud snapshot and its pinned immutable photo references."""
+    from sheets_store import SheetsStorageError, decode_guest, decode_visit
+    try:
+        extras = tuple(extras)
+        wire = primary.snapshot(include_photos=include_photos, now=instant,
+                                photo_transform=photo_transform)
+        moment = _valid_timestamp(wire["generated_at"]).astimezone(timezone.utc)
+        guests = {}
+        for value in wire["guests"]:
+            guest = decode_guest(value)
+            if guest.id in guests:
+                raise ValueError("Duplicate guest")
+            guests[guest.id] = guest
+        grouped = {id: [] for id in guests}
+        seen = set()
+        for value in wire["visits"]:
+            visit = decode_visit(value)
+            if visit.id in seen or visit.guest_id not in grouped:
+                raise ValueError("Invalid visit reference")
+            seen.add(visit.id)
+            grouped[visit.guest_id].append(visit)
+        rows = []
+        for guest in guests.values():
+            visits = tuple(sorted(grouped[guest.id],
+                                  key=lambda item: (_valid_timestamp(item.started_at), item.id), reverse=True))
+            active = [item for item in visits if item.stopped_at is None]
+            if len(active) > 1:
+                raise ValueError("Multiple active visits")
+            completed = [item for item in visits if item.stopped_at is not None]
+            summary = VisitSummary(active[0] if active else None, len(completed),
+                                   sum(item.duration_seconds(moment) for item in completed),
+                                   active[0].duration_seconds(moment) if active else 0)
+            rows.append(ReportGuest(1, _source_name(1), guest, summary, visits))
+        # Legacy additional SQLite sources remain explicit and read-only.
+        extra_paths = _unique_paths(extras[0], extras[1:]) if extras else ()
+        for index, path in enumerate(extra_paths, 2):
+            rows.extend(_read_source(path, index, include_photos, moment, photo_transform))
+        return ReportSnapshot(moment, tuple(_source_name(index) for index in range(1, len(extra_paths) + 2)), tuple(rows))
+    except (SheetsStorageError, ValueError, TypeError, KeyError, OverflowError):
+        raise _failure(_source_name(1)) from None

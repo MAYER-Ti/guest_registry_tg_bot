@@ -262,14 +262,42 @@ def _search_filter(query: str) -> tuple[str, list[str]]:
 
 
 class Store:
-    """Shared database; each operation opens its own short-lived connection."""
+    """Shared database; each operation opens its own short-lived connection.
 
-    def __init__(self, path: Path | str) -> None:
+    Production callers use ``create=False`` to require an existing registry.
+    Explicit initialization may create a file once; normal connections never
+    create a replacement if the working file disappears.
+    """
+
+    def __init__(self, path: Path | str, *, create: bool = True) -> None:
+        if type(create) is not bool:
+            raise ValueError("Параметр создания базы должен быть логическим значением.")
         self.path = Path(path).expanduser().resolve()
+        if not create and not self.path.is_file():
+            raise FileNotFoundError("Рабочая база данных не найдена. Нужна проверка хранилища или восстановление копии.")
         # Python 3.13 maps 0700 to a Windows DACL that can exclude sandbox
         # tokens. Use the inherited Windows ACL; keep owner-only Linux dirs.
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o777 if os.name == "nt" else 0o700)
+        if create:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o777 if os.name == "nt" else 0o700)
+            if not self.path.exists():
+                # Only this explicit initialization may create the file. Close
+                # it before normal operations so a later disappearance cannot
+                # consume a stale creation permission, even during migration.
+                initial = sqlite3.connect(self.path.as_uri() + "?mode=rwc", uri=True, timeout=30)
+                initial.close()
+        # Creation is an explicit startup operation. Every later connection,
+        # including migration backups, uses mode=rw and cannot replace a lost
+        # working database with a new, empty SQLite file.
         with self._connection() as connection:
+            if not create:
+                try:
+                    registry = connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='guests'"
+                    ).fetchone()
+                except sqlite3.DatabaseError:
+                    raise sqlite3.DatabaseError("Рабочая база повреждена или имеет неверный формат.") from None
+                if registry is None:
+                    raise sqlite3.DatabaseError("Рабочая база не содержит картотеку гостей.")
             connection.execute("PRAGMA journal_mode=WAL")
             tables = {row[0] for row in connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
@@ -392,11 +420,17 @@ class Store:
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(str(self.path), timeout=30)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=30000")
-        connection.execute("PRAGMA foreign_keys=ON")
+        uri = self.path.as_uri() + "?mode=rw"
         try:
+            connection = sqlite3.connect(uri, uri=True, timeout=30)
+        except sqlite3.OperationalError:
+            if not self.path.is_file():
+                raise FileNotFoundError("Рабочая база данных не найдена. Нужна проверка хранилища или восстановление копии.") from None
+            raise
+        connection.row_factory = sqlite3.Row
+        try:
+            connection.execute("PRAGMA busy_timeout=30000")
+            connection.execute("PRAGMA foreign_keys=ON")
             yield connection
         finally:
             connection.close()

@@ -7,6 +7,7 @@ import re
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 class ConfigError(ValueError):
@@ -20,6 +21,40 @@ class Config:
     db_path: Path
     extra_db_paths: tuple[Path, ...] = field(default=(), repr=False)
     admin_user_id: int = 7011639945
+    storage_backend: str = "sqlite"
+    sheets_endpoint: str = field(default="", repr=False)
+    sheets_secret: str = field(default="", repr=False)
+    google_owner_email: str = field(default="", repr=False)
+    allow_new_database: bool = False
+
+
+def _storage_settings() -> dict:
+    backend = os.environ.get("STORAGE_BACKEND", "sqlite").strip()
+    if backend not in {"sqlite", "google_sheets"}:
+        raise ConfigError("STORAGE_BACKEND должен быть sqlite или google_sheets.")
+    allow_new = os.environ.get("ALLOW_NEW_DATABASE", "0").strip()
+    if allow_new not in {"0", "1"}:
+        raise ConfigError("ALLOW_NEW_DATABASE должен быть 0 или 1.")
+    settings = {"storage_backend": backend, "allow_new_database": allow_new == "1"}
+    if backend == "google_sheets":
+        endpoint = os.environ.get("SHEETS_ENDPOINT", "").strip()
+        secret = os.environ.get("SHEETS_SECRET", "")
+        owner = os.environ.get("SHEETS_OWNER_EMAIL", "").strip().casefold()
+        try:
+            parsed = urlsplit(endpoint)
+            valid = (parsed.scheme == "https" and parsed.netloc == "script.google.com"
+                     and re.fullmatch(r"/macros/s/[A-Za-z0-9_-]+/exec", parsed.path)
+                     and not parsed.query and not parsed.fragment)
+        except ValueError:
+            valid = False
+        if not valid:
+            raise ConfigError("Задайте SHEETS_ENDPOINT — опубликованный HTTPS-адрес Google Apps Script.")
+        if not 32 <= len(secret) <= 512 or not secret.isascii() or any(char.isspace() for char in secret):
+            raise ConfigError("Задайте SHEETS_SECRET длиной от 32 до 512 символов без пробелов.")
+        if len(owner) > 254 or not re.fullmatch(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", owner):
+            raise ConfigError("Задайте SHEETS_OWNER_EMAIL — Google-аккаунт владельца хранилища.")
+        settings.update(sheets_endpoint=endpoint, sheets_secret=secret, google_owner_email=owner)
+    return settings
 
 
 def get_db_path() -> Path:
@@ -76,4 +111,5 @@ def load_config() -> Config:
         allowed_user_ids=frozenset(int(part) for part in parts),
         db_path=get_db_path(),
         extra_db_paths=get_extra_db_paths(),
+        **_storage_settings(),
     )

@@ -9,6 +9,7 @@ import main
 
 
 class RuntimeTests(unittest.IsolatedAsyncioTestCase):
+
     async def test_worker_starts_and_stops_before_bot_closes_even_on_polling_failure(self):
         for fail in (False, True):
             with self.subTest(fail=fail):
@@ -52,7 +53,7 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
                 dispatcher.resolve_used_update_types.return_value = ["message", "callback_query"]
                 dispatcher.start_polling = AsyncMock(side_effect=polling)
                 with patch.object(main, "load_config", return_value=config), \
-                        patch.object(main, "Store", return_value=store), \
+                        patch.object(main, "open_store", return_value=store), \
                         patch.object(main, "build_dispatcher", return_value=dispatcher), \
                         patch.object(main, "Bot", return_value=bot), \
                         patch.object(main, "reminder_loop", side_effect=reminder_worker):

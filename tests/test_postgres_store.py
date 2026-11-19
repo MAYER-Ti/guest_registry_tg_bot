@@ -296,6 +296,59 @@ class PostgresStoreTests(unittest.TestCase):
         store.bootstrap_employee_access([1234], ADMIN)
         self.assertFalse(any(query.startswith("INSERT") for query, _, _ in self.driver.connections[-1].commands))
 
+    def test_remove_employee_checks_pinned_owner_and_only_deletes_the_matching_grant(self):
+        store = self.store()
+        def handler(query, params):
+            if query.startswith("DELETE FROM guest_registry.employee_access"):
+                return Result(rowcount=1)
+        self.driver.handler = handler
+        self.assertTrue(store.remove_employee(1234, ADMIN, expected_added_at=STAMP))
+        connection = self.driver.connections[-1]
+        deletes = [(query, params) for query, params, _ in connection.commands if query.startswith("DELETE")]
+        self.assertEqual(deletes, [("DELETE FROM guest_registry.employee_access WHERE user_id=%s AND added_at=%s",
+                                    (1234, STAMP))])
+        self.assertTrue(any("admin_id FROM guest_registry.registry_meta" in query and "FOR UPDATE" in query
+                            for query, _, _ in connection.commands))
+        self.assertTrue(connection.committed)
+        for target, actor, kind in ((1234, 999, PermissionError),
+                                    (object(), 999, PermissionError),
+                                    (ADMIN, ADMIN, ValueError),
+                                    (True, ADMIN, ValueError)):
+            with self.subTest(target=target, actor=actor), self.assertRaises(kind):
+                store.remove_employee(target, actor)
+            self.assertTrue(self.driver.connections[-1].rolled_back)
+            self.assertFalse(any(query.startswith("DELETE") for query, _, _ in self.driver.connections[-1].commands))
+
+    def test_remove_employee_returns_false_for_missing_or_replaced_grant(self):
+        store = self.store()
+        self.assertFalse(store.remove_employee(1234, ADMIN, expected_added_at=STAMP))
+        self.assertTrue(self.driver.connections[-1].committed)
+        self.assertFalse(store.remove_employee(1234, ADMIN))
+        self.assertIn(("DELETE FROM guest_registry.employee_access WHERE user_id=%s", (1234,), {}),
+                      self.driver.connections[-1].commands)
+        for stamp in (True, "", "bad-time", "2026-11-19T10:00:00"):
+            with self.subTest(stamp=stamp), self.assertRaises(ValueError):
+                store.remove_employee(1234, ADMIN, expected_added_at=stamp)
+            self.assertFalse(any(query.startswith("DELETE") for query, _, _ in self.driver.connections[-1].commands))
+
+    def test_get_employee_returns_exact_grant_or_none_using_read_only_connection(self):
+        store = self.store()
+        grant = dict(user_id=1234, added_by=ADMIN, added_at=STAMP)
+        def handler(query, params):
+            if query.startswith("SELECT user_id, added_by, added_at FROM guest_registry.employee_access"):
+                self.assertEqual(params, (1234,))
+                return Result([grant])
+        self.driver.handler = handler
+        self.assertEqual(asdict(store.get_employee(1234)), grant)
+        self.assertTrue(self.driver.connections[-1].commands[0][0].endswith("READ ONLY"))
+        self.driver.handler = None
+        self.assertIsNone(store.get_employee(1234))
+        before = len(self.driver.connections)
+        for value in (True, 0, -1234, "1234", None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                store.get_employee(value)
+        self.assertEqual(len(self.driver.connections), before)
+
     def test_summary_adds_only_residual_baseline_and_exact_visits(self):
         store = self.store()
         now = datetime(2026, 11, 9, 12, tzinfo=timezone.utc)

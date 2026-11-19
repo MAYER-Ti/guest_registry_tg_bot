@@ -1,4 +1,4 @@
-"""One administrator grants persistent employee access to the shared registry.
+"""One administrator manages persistent employee access to the shared registry.
 
 Telegram profile names and usernames never grant permissions. The sole admin
 is supplied by the application's configuration, not selected by a Telegram
@@ -31,7 +31,7 @@ def parse_employee_id(raw: str) -> int:
 
 
 class AccessPolicy:
-    """Owner-only grants; existing employees cannot appoint or become admins."""
+    """Owner-only access management; employees cannot appoint or become admins."""
 
     def __init__(self, config: Config, store: Store):
         if not _telegram_id(config.admin_user_id):
@@ -58,8 +58,18 @@ class AccessPolicy:
             raise ValueError("Этот ID уже является администратором.")
         return self.store.add_employee(target_id, actor_id)
 
+    def remove_employee(self, actor_id: int, target_id: int, *,
+                        expected_added_at: str | None = None) -> bool:
+        if not self.is_admin(actor_id):
+            raise PermissionError("Удалять сотрудников может только администратор.")
+        if not _telegram_id(target_id):
+            raise ValueError("Некорректный Telegram ID сотрудника.")
+        if target_id == self.admin_user_id:
+            raise ValueError("Доступ главного администратора нельзя удалить.")
+        return self.store.remove_employee(target_id, actor_id, expected_added_at=expected_added_at)
+
     def allowed_ids(self) -> frozenset[int]:
-        """Take a fresh permission snapshot, including newly added employees."""
+        """Take a fresh snapshot, reflecting grants and revocations immediately."""
         return frozenset({self.admin_user_id} | {
             user_id for user_id in self.store.employee_ids() if _telegram_id(user_id)
         })

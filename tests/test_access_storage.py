@@ -144,6 +144,85 @@ class EmployeeAccessStorageTests(unittest.TestCase):
         self.bootstrap((102,))
         self.assertEqual(self.store.employee_ids(), frozenset({102}))
 
+    def test_remove_only_revokes_access_and_preserves_guest_records_history_and_profiles(self):
+        self.bootstrap()
+        self.store.remember_staff(101, "Сотрудник", "worker")
+        guest = self.store.add_guest(name="Гость", phone="79991234567", comment="Комментарий",
+                                     photo=b"photo", photo_file_id="file", actor_id=101)
+        visit = self.store.start_visit(guest.id, guest.version, 101)
+        self.store.mark_reminder_sent(visit.id, 101)
+        tables = ("guests", "visits", "audit_events", "staff", "visit_reminders", "access_settings")
+        with self.store._connection() as connection:
+            before = {table: [tuple(row) for row in connection.execute(f"SELECT * FROM {table}")]
+                      for table in tables}
+        grant = self.store.get_employee(101)
+        self.assertIsInstance(grant, EmployeeAccess)
+        self.assertTrue(self.store.remove_employee(101, ADMIN, expected_added_at=grant.added_at))
+        self.assertIsNone(self.store.get_employee(101))
+        self.assertFalse(self.store.remove_employee(101, ADMIN))
+        self.assertEqual(self.store.employee_ids(), frozenset({102}))
+        with self.store._connection() as connection:
+            after = {table: [tuple(row) for row in connection.execute(f"SELECT * FROM {table}")]
+                     for table in tables}
+        self.assertEqual(after, before)
+        reopened = Store(self.store.path)
+        reopened.bootstrap_employee_access((101, 102), ADMIN)
+        self.assertFalse(reopened.has_employee_access(101))
+
+    def test_removal_is_owner_only_and_cannot_remove_administrator(self):
+        with self.assertRaises(PermissionError):
+            self.store.remove_employee(101, ADMIN)
+        self.bootstrap()
+        before = self.store.list_employees()
+        for actor in (101, 102, 999):
+            with self.subTest(actor=actor), self.assertRaises(PermissionError):
+                self.store.remove_employee(object(), actor)
+        with self.assertRaises(ValueError):
+            self.store.remove_employee(ADMIN, ADMIN)
+        self.assertEqual(self.store.list_employees(), before)
+
+    def test_stale_removal_cannot_revoke_new_grant_for_same_employee(self):
+        self.bootstrap(())
+        with patch("storage._timestamp", return_value="2026-11-19T10:00:00.000000+00:00"):
+            self.store.add_employee(101, ADMIN)
+        old = self.store.get_employee(101)
+        self.assertTrue(self.store.remove_employee(101, ADMIN, expected_added_at=old.added_at))
+        with patch("storage._timestamp", return_value="2026-11-19T10:01:00.000000+00:00"):
+            self.store.add_employee(101, ADMIN)
+        current = self.store.get_employee(101)
+        self.assertFalse(self.store.remove_employee(101, ADMIN, expected_added_at=old.added_at))
+        self.assertEqual(self.store.get_employee(101), current)
+        self.assertTrue(self.store.remove_employee(101, ADMIN, expected_added_at=current.added_at))
+
+    def test_racing_revocations_commit_exactly_once(self):
+        self.bootstrap()
+        grant = self.store.get_employee(101)
+        barrier = Barrier(2)
+
+        def remove(_):
+            barrier.wait()
+            return self.store.remove_employee(101, ADMIN, expected_added_at=grant.added_at)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            self.assertEqual(sorted(pool.map(remove, range(2))), [False, True])
+        self.assertFalse(self.store.has_employee_access(101))
+        self.assertTrue(self.store.has_employee_access(102))
+
+    def test_invalid_removal_ids_and_timestamps_never_change_access(self):
+        self.bootstrap()
+        before = self.store.list_employees()
+        invalid = (True, False, 0, -1, "101", 1.0, None, MAX_ACCESS_ID + 1)
+        for value in invalid:
+            for operation in (lambda: self.store.remove_employee(value, ADMIN),
+                              lambda: self.store.remove_employee(101, value),
+                              lambda: self.store.get_employee(value)):
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    operation()
+        for stamp in (True, 1, "", "not-a-date", "2026-11-19T10:00:00", "x" * 65):
+            with self.subTest(stamp=stamp), self.assertRaises(ValueError):
+                self.store.remove_employee(101, ADMIN, expected_added_at=stamp)
+        self.assertEqual(self.store.list_employees(), before)
+
     def test_failed_seed_rolls_back_settings_and_all_employee_inserts(self):
         with self.store._connection() as connection, connection:
             connection.execute("""

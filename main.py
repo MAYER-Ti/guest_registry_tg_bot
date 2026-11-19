@@ -111,6 +111,10 @@ class AddEmployee(StatesGroup):
     confirm = State()
 
 
+class RemoveEmployee(StatesGroup):
+    confirm = State()
+
+
 def keyboard(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=label, callback_data=value) for label, value in row]
@@ -721,15 +725,17 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
         employees = await asyncio.to_thread(store.list_employees, PAGE_SIZE, offset)
         lines = [EMPLOYEES, f"Администратор: {access.admin_user_id}",
                  f"Сотрудников с доступом: {total}"]
+        rows = [[(ADD_EMPLOYEE, "staff:add")]]
         for index, employee in enumerate(employees, offset + 1):
             label = await asyncio.to_thread(store.staff_label, employee.user_id)
             identity = label if label.startswith("Telegram ID ") else f"{label} · ID {employee.user_id}"
             lines.append(f"\n{index}. {identity}\nДобавлен: {format_visit_time(employee.added_at)} МСК")
+            rows.append([(f"🗑 Удалить №{index} · ID {employee.user_id}",
+                          f"staff:remove:{employee.user_id}")])
         if not employees:
             lines.append("\nПока доступ есть только у администратора.")
         lines.append("\nНовый сотрудник отправляет боту /myid и передаёт тебе числовой ID. "
-                     "Добавлять сотрудников может только администратор.")
-        rows = [[(ADD_EMPLOYEE, "staff:add")]]
+                     "Добавлять и удалять сотрудников может только администратор.")
         navigation = []
         if offset:
             navigation.append(("← Назад", f"staff:list:{max(0, offset - PAGE_SIZE)}"))
@@ -833,6 +839,74 @@ def build_dispatcher(config: Config, store: Store) -> Dispatcher:
             if added else f"У сотрудника {data['employee_id']} уже есть доступ.",
             reply_markup=menu_for(query.message), protect_content=True,
         )
+
+    @router.callback_query(F.data.startswith("staff:remove:"))
+    async def remove_employee_preview(query: CallbackQuery, state: FSMContext):
+        if not await admin_only(query):
+            return
+        parts = query.data.split(":")
+        try:
+            if len(parts) != 3:
+                raise ValueError("Некорректный Telegram ID сотрудника.")
+            target_id = parse_employee_id(parts[2])
+            if access.is_admin(target_id):
+                raise ValueError("Нельзя удалить главного администратора.")
+        except ValueError as error:
+            await answer_callback(query, str(error), show_alert=True)
+            return
+        employee = await asyncio.to_thread(store.get_employee, target_id)
+        if employee is None:
+            await answer_callback(query, "У сотрудника уже нет доступа. Обнови список.", show_alert=True)
+            return
+        label = await asyncio.to_thread(store.staff_label, target_id)
+        nonce = secrets.token_hex(8)
+        await state.clear()
+        await state.set_state(RemoveEmployee.confirm)
+        await state.update_data(employee_id=target_id, employee_nonce=nonce,
+                                employee_added_at=employee.added_at)
+        await answer_callback(query)
+        await query.message.answer(
+            f"Удалить сотрудника из доступа к боту?\n{label}\nTelegram ID: {target_id}\n\n"
+            "Он сразу потеряет доступ к картотеке и отчётам. "
+            "Карточки гостей, посещения и история его изменений сохранятся.",
+            reply_markup=keyboard([[("🗑 Удалить сотрудника", f"staffremove:{target_id}:{nonce}"),
+                                    (CANCEL, "cancel")]]), protect_content=True,
+        )
+
+    @router.callback_query(F.data.startswith("staffremove:"))
+    async def confirm_employee_removal(query: CallbackQuery, state: FSMContext, bot: Bot):
+        if not await admin_only(query):
+            return
+        data = await state.get_data()
+        expected = f"staffremove:{data.get('employee_id')}:{data.get('employee_nonce')}"
+        if await state.get_state() != RemoveEmployee.confirm.state or query.data != expected:
+            await answer_callback(query, "Подтверждение уже закрыто. Открой список сотрудников заново.",
+                                  show_alert=True)
+            return
+        target_id = data["employee_id"]
+        target_state = dispatcher.fsm.get_context(bot=bot, chat_id=target_id, user_id=target_id)
+        try:
+            # Finish any already running employee step before revoking access.
+            # Queued updates then recheck permissions, and the old draft is gone.
+            async with dispatcher.fsm.events_isolation.lock(key=target_state.key):
+                removed = await asyncio.to_thread(
+                    access.remove_employee, query.from_user.id, target_id,
+                    expected_added_at=data["employee_added_at"],
+                )
+                if removed:
+                    await target_state.clear()
+        except (PermissionError, ValueError) as error:
+            await answer_callback(query, str(error), show_alert=True)
+            await state.clear()
+            return
+        await state.clear()
+        await answer_callback(query, "Доступ закрыт." if removed else "Список доступа изменился.")
+        await query.message.answer(
+            f"Сотрудник {target_id} удалён из доступа к боту."
+            if removed else "Доступ этого сотрудника уже изменился. Проверь список и повтори действие.",
+            reply_markup=menu_for(query.message), protect_content=True,
+        )
+        await staff_page(query.message)
 
     @router.message(F.text == ADD)
     async def add_start(message: Message, state: FSMContext):

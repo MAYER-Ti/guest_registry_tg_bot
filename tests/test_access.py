@@ -132,6 +132,39 @@ class AccessPolicyTests(unittest.TestCase):
         self.assertNotIn(103, before)
         self.assertIn(103, self.access.allowed_ids())
 
+    def test_removal_immediately_revokes_access_and_persists_without_reseeding(self):
+        grant = self.store.get_employee(101)
+        self.assertTrue(self.access.remove_employee(ADMIN, 101, expected_added_at=grant.added_at))
+        self.assertFalse(self.access.allows(101))
+        self.assertNotIn(101, self.access.allowed_ids())
+        restarted = AccessPolicy(self.config, Store(self.store.path))
+        self.assertFalse(restarted.allows(101))
+        self.assertTrue(restarted.allows(102))
+        self.assertTrue(restarted.allows(ADMIN))
+        self.assertFalse(restarted.remove_employee(ADMIN, 101))
+        self.assertTrue(restarted.add_employee(ADMIN, 101))
+        self.assertTrue(self.access.allows(101))
+
+    def test_only_owner_can_remove_and_actor_is_checked_before_target_or_storage(self):
+        proxy = Mock(wraps=self.store)
+        access = AccessPolicy(self.config, proxy)
+        proxy.reset_mock()
+        for actor in (101, 999, str(ADMIN), True):
+            with self.subTest(actor=actor), self.assertRaises(PermissionError):
+                access.remove_employee(actor, object())
+        proxy.remove_employee.assert_not_called()
+        self.assertTrue(self.access.allows(101))
+
+    def test_removal_rejects_admin_and_invalid_targets_before_storage(self):
+        proxy = Mock(wraps=self.store)
+        access = AccessPolicy(self.config, proxy)
+        proxy.reset_mock()
+        for target in (ADMIN, None, True, "103", 0, -103, 1.5, MAX_TELEGRAM_USER_ID + 1):
+            with self.subTest(target=target), self.assertRaises(ValueError):
+                access.remove_employee(ADMIN, target)
+        proxy.remove_employee.assert_not_called()
+        self.assertTrue(access.allows(ADMIN))
+
 
 if __name__ == "__main__":
     unittest.main()

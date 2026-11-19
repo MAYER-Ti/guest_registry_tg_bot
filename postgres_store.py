@@ -23,7 +23,7 @@ from storage import (
     AuditEvent, DuplicatePhoneError, EmployeeAccess, Guest, MAX_ACCESS_ID,
     MAX_PHOTO_BYTES, StaleGuestError, Visit, VisitStateError, VisitSummary,
     _EDITABLE_FIELDS, _card_changes, _restrict_permissions, _search_filter,
-    _timestamp, _utc_datetime, _validate_access_id, _validate_actor,
+    _timestamp, _utc_datetime, _validate_access_id, _validate_access_timestamp, _validate_actor,
     _validate_fields, _validate_identifier, _validate_page, normalize_name,
     normalize_phone,
 )
@@ -577,6 +577,28 @@ class PostgresStore:
             if user_id == actor_id:
                 return False
             return connection.execute("INSERT INTO guest_registry.employee_access (user_id, added_by, added_at) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING", (user_id, actor_id, _timestamp())).rowcount == 1
+
+    def remove_employee(self, user_id, actor_id, *, expected_added_at: str | None = None) -> bool:
+        _validate_access_id(actor_id)
+        with self._connection() as connection:
+            meta = connection.execute("SELECT admin_id FROM guest_registry.registry_meta WHERE singleton=1 FOR UPDATE").fetchone()
+            if meta["admin_id"] != actor_id:
+                raise PermissionError("Удалять сотрудников может только администратор.")
+            _validate_access_id(user_id)
+            if user_id == meta["admin_id"]:
+                raise ValueError("Доступ главного администратора нельзя удалить.")
+            _validate_access_timestamp(expected_added_at)
+            query, params = "DELETE FROM guest_registry.employee_access WHERE user_id=%s", (user_id,)
+            if expected_added_at is not None:
+                query += " AND added_at=%s"
+                params += (expected_added_at,)
+            return connection.execute(query, params).rowcount == 1
+
+    def get_employee(self, user_id) -> EmployeeAccess | None:
+        _validate_access_id(user_id)
+        with self._connection(read_only=True) as connection:
+            row = connection.execute("SELECT user_id, added_by, added_at FROM guest_registry.employee_access WHERE user_id=%s", (user_id,)).fetchone()
+        return EmployeeAccess(**row) if row is not None else None
 
     def has_employee_access(self, user_id) -> bool:
         _validate_access_id(user_id)

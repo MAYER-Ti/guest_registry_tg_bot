@@ -140,6 +140,17 @@ def _validate_access_id(value: int) -> None:
         raise ValueError("Некорректный Telegram ID сотрудника.")
 
 
+def _validate_access_timestamp(value: str | None) -> None:
+    if value is None:
+        return
+    if not isinstance(value, str) or not value or len(value) > 64:
+        raise ValueError("Некорректное время добавления сотрудника.")
+    try:
+        _utc_datetime(datetime.fromisoformat(value))
+    except (ValueError, OverflowError):
+        raise ValueError("Некорректное время добавления сотрудника.") from None
+
+
 def _validate_identifier(value: int) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError("Некорректный идентификатор.")
@@ -773,6 +784,33 @@ class Store:
                 VALUES (?, ?, ?)
             """, (user_id, actor_id, _timestamp()))
             return cursor.rowcount == 1
+
+    def remove_employee(self, user_id: int, actor_id: int, *,
+                        expected_added_at: str | None = None) -> bool:
+        """Revoke just this grant; an older confirmation cannot remove a new one."""
+        _validate_access_id(actor_id)
+        with self._connection() as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            settings = connection.execute("SELECT admin_id FROM access_settings WHERE singleton = 1").fetchone()
+            if settings is None or settings["admin_id"] != actor_id:
+                raise PermissionError("Удалять сотрудников может только администратор.")
+            _validate_access_id(user_id)
+            if user_id == settings["admin_id"]:
+                raise ValueError("Доступ главного администратора нельзя удалить.")
+            _validate_access_timestamp(expected_added_at)
+            query, params = "DELETE FROM employee_access WHERE user_id = ?", (user_id,)
+            if expected_added_at is not None:
+                query += " AND added_at = ?"
+                params += (expected_added_at,)
+            return connection.execute(query, params).rowcount == 1
+
+    def get_employee(self, user_id: int) -> EmployeeAccess | None:
+        _validate_access_id(user_id)
+        with self._connection() as connection:
+            row = connection.execute("""
+                SELECT user_id, added_by, added_at FROM employee_access WHERE user_id = ?
+            """, (user_id,)).fetchone()
+        return EmployeeAccess(**dict(row)) if row is not None else None
 
     def has_employee_access(self, user_id: int) -> bool:
         _validate_access_id(user_id)

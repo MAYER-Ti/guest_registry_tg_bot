@@ -1,4 +1,4 @@
-"""Owner-only employee grants exercised with real SQLite and fake Telegram."""
+"""Owner-only employee access exercised with real SQLite and fake Telegram."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -104,6 +104,10 @@ class AdminBotTests(unittest.IsolatedAsyncioTestCase):
 
     async def state_for(self, user_id=OWNER):
         return await self.dp.fsm.get_context(bot=self.bot, chat_id=user_id, user_id=user_id).get_state()
+
+    async def removal_preview(self, user_id=WORKER):
+        calls = await self.callback(f"staff:remove:{user_id}")
+        return self.button(calls, "staffremove:"), calls
 
     async def test_owner_alone_sees_employee_management_button(self):
         owner = await self.message("/start")
@@ -265,10 +269,127 @@ class AdminBotTests(unittest.IsolatedAsyncioTestCase):
         combined = self.texts(first) + self.texts(second)
         for user_id in ids:
             self.assertIn(str(user_id), combined)
+        self.assertTrue({f"staff:remove:{user_id}" for user_id in ids}
+                        <= set(self.callbacks(first) + self.callbacks(second)))
+        self.assertNotIn(f"staff:remove:{OWNER}", self.callbacks(first) + self.callbacks(second))
         self.assertIn("staff:list:0", self.callbacks(second))
         for data in ("staff:list:²", "staff:list:-1", "staff:list:9223372036854775808"):
             malformed = await self.callback(data)
             self.assertTrue(any(isinstance(call, AnswerCallbackQuery) and call.show_alert for call in malformed))
+
+    async def test_owner_removes_access_and_preserves_guest_visits_history_and_profile(self):
+        save, _ = await self.draft(user_id=WORKER)
+        await self.callback(save, user_id=WORKER)
+        guest = self.store.find_phone("79991234567")
+        self.store.start_visit(guest.id, guest.version, WORKER)
+        before_guest = self.store.get_guest(guest.id)
+        before_audit = self.store.list_audit(guest.id, limit=100)
+        before_visits = self.store.list_visits(guest.id, limit=100)
+        before_label = self.store.staff_label(WORKER)
+        confirmation, preview = await self.removal_preview()
+        self.assertIn(str(WORKER), self.texts(preview))
+        self.assertIn("Employee 101", self.texts(preview))
+        self.assertTrue(self.store.has_employee_access(WORKER))
+        removed = await self.callback(confirmation)
+        self.assertIn("удалён из доступа", self.texts(removed))
+        self.assertFalse(self.store.has_employee_access(WORKER))
+        self.assertTrue(self.dp["access_policy"].allows(OWNER))
+        self.assertEqual(self.store.get_guest(guest.id), before_guest)
+        self.assertEqual(self.store.list_audit(guest.id, limit=100), before_audit)
+        self.assertEqual(self.store.list_visits(guest.id, limit=100), before_visits)
+        self.assertEqual(self.store.staff_label(WORKER), before_label)
+        replay = await self.callback(confirmation)
+        self.assertTrue(any(isinstance(call, AnswerCallbackQuery) and call.show_alert for call in replay))
+        self.store = Store(self.store.path)
+        await self.configure(frozenset({OWNER, WORKER}))
+        denied = await self.message("/start", user_id=WORKER)
+        self.assertIn("Доступ только для сотрудников", self.texts(denied))
+        self.assertFalse(self.store.has_employee_access(WORKER))
+
+    async def test_removal_clears_employee_draft_and_blocks_old_buttons_messages_and_reports(self):
+        save, _ = await self.draft(user_id=WORKER)
+        self.assertEqual(main.AddGuest.confirm.state, await self.state_for(WORKER))
+        confirmation, _ = await self.removal_preview()
+        await self.callback(confirmation)
+        self.assertIsNone(await self.state_for(WORKER))
+        pending = await self.callback(save, user_id=WORKER)
+        self.assertTrue(any(isinstance(call, AnswerCallbackQuery) and call.show_alert for call in pending))
+        self.assertEqual(self.store.count_search(""), 0)
+        for command in (main.ADD, main.FIND, main.EXPORT, main.TOTAL, main.STATS, main.PRESENT):
+            denied = await self.message(command, user_id=WORKER)
+            self.assertIn("Доступ только для сотрудников", self.texts(denied))
+            self.assertIsNone(await self.state_for(WORKER))
+        identity = await self.message("/myid", user_id=WORKER)
+        self.assertIn(str(WORKER), self.texts(identity))
+        await self.grant(WORKER)
+        self.assertIsNone(await self.state_for(WORKER))
+        self.assertIn(main.ADD, self.menu_labels(await self.message("/start", user_id=WORKER)))
+        await self.callback(save, user_id=WORKER)
+        self.assertEqual(self.store.count_search(""), 0)
+
+    async def test_only_owner_can_preview_and_confirm_employee_removal(self):
+        confirmation, _ = await self.removal_preview()
+        with patch.object(self.store, "remove_employee", side_effect=AssertionError("Must not revoke")) as write, \
+                patch.object(self.store, "get_employee", side_effect=AssertionError("Must not read")) as read:
+            for actor in (WORKER, STRANGER):
+                for callback in (f"staff:remove:{WORKER}", confirmation):
+                    denied = await self.callback(callback, user_id=actor)
+                    self.assertTrue(any(isinstance(call, AnswerCallbackQuery) and call.show_alert for call in denied))
+            for callback in (f"staff:remove:{WORKER}", confirmation):
+                denied = await self.callback(callback, group=True)
+                self.assertTrue(any(isinstance(call, AnswerCallbackQuery) and call.show_alert for call in denied))
+            write.assert_not_called()
+            read.assert_not_called()
+        self.assertTrue(self.store.has_employee_access(WORKER))
+
+    async def test_removal_confirmation_binds_target_nonce_and_active_draft(self):
+        confirmation, _ = await self.removal_preview()
+        nonce = confirmation.split(":")[-1]
+        for forged in (f"staffremove:{OWNER}:{nonce}", f"staffremove:{WORKER}:wrongnonce",
+                       "staffremove:²:abc", "staffremove:0:abc", "staffremove:None:None"):
+            denied = await self.callback(forged)
+            self.assertTrue(any(isinstance(call, AnswerCallbackQuery) and call.show_alert for call in denied))
+            self.assertTrue(self.store.has_employee_access(WORKER))
+        await self.callback(confirmation)
+        self.assertFalse(self.store.has_employee_access(WORKER))
+
+    async def test_cancelled_and_replaced_removal_confirmations_cannot_revoke(self):
+        for cancel in ("/cancel", "/start", "/staff", main.ADD):
+            confirmation, _ = await self.removal_preview()
+            await self.message(cancel)
+            await self.callback(confirmation)
+            self.assertTrue(self.store.has_employee_access(WORKER))
+        confirmation, _ = await self.removal_preview()
+        await self.callback("cancel")
+        await self.callback(confirmation)
+        self.assertTrue(self.store.has_employee_access(WORKER))
+        older, _ = await self.removal_preview()
+        newer, _ = await self.removal_preview()
+        await self.callback(older)
+        self.assertTrue(self.store.has_employee_access(WORKER))
+        await self.callback(newer)
+        self.assertFalse(self.store.has_employee_access(WORKER))
+
+    async def test_old_confirmation_does_not_revoke_newer_grant(self):
+        original = self.store.get_employee(WORKER)
+        confirmation, _ = await self.removal_preview()
+        self.assertTrue(self.store.remove_employee(WORKER, OWNER))
+        self.assertTrue(self.store.add_employee(WORKER, OWNER))
+        self.assertNotEqual(original.added_at, self.store.get_employee(WORKER).added_at)
+        changed = await self.callback(confirmation)
+        self.assertIn("уже изменился", self.texts(changed))
+        self.assertTrue(self.store.has_employee_access(WORKER))
+        self.assertIsNone(await self.state_for())
+
+    async def test_missing_employee_and_invalid_removal_targets_never_open_confirmation(self):
+        with patch.object(self.store, "remove_employee", side_effect=AssertionError("Must not revoke")) as write:
+            for target in (OWNER, STRANGER, "0", "-1", "²", "9223372036854775808", "101:extra"):
+                calls = await self.callback(f"staff:remove:{target}")
+                self.assertTrue(any(isinstance(call, AnswerCallbackQuery) and call.show_alert for call in calls))
+                self.assertFalse(any(value.startswith("staffremove:") for value in self.callbacks(calls)))
+            write.assert_not_called()
+        self.assertTrue(self.dp["access_policy"].allows(OWNER))
+        self.assertTrue(self.store.has_employee_access(WORKER))
 
 
 if __name__ == "__main__":
